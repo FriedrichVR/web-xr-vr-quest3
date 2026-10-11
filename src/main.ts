@@ -33,6 +33,7 @@ class WebXRGLBViewer {
   // Environment & Passthrough (MR / VR) State
   private isPassthrough: boolean = false;
   private prevButtonAState: boolean = false;
+  private vrSkyDome!: THREE.Mesh;
   private grid!: THREE.GridHelper;
   private pedestal!: THREE.Mesh;
   private vrBackgroundColor = new THREE.Color(0x090d16);
@@ -47,11 +48,12 @@ class WebXRGLBViewer {
     initialModelRot: THREE.Quaternion;
   }> = new Map();
 
-  // Two-hand manipulation cache
+  // Two-hand manipulation cache (full 3-axis rotation & scale)
   private twoHandState: {
     initialDistance: number;
     initialMidpoint: THREE.Vector3;
-    initialAngle: number;
+    initialDir: THREE.Vector3;
+    initialControllerUp: THREE.Vector3;
     initialModelScale: THREE.Vector3;
     initialModelPos: THREE.Vector3;
     initialModelQuat: THREE.Quaternion;
@@ -244,6 +246,16 @@ class WebXRGLBViewer {
     this.pedestal.rotation.x = -Math.PI / 2;
     this.pedestal.receiveShadow = true;
     this.scene.add(this.pedestal);
+
+    // Full 360 VR Sky Dome (guarantees 100% full VR void occlusion in WebXR AR/VR)
+    const skyGeo = new THREE.SphereGeometry(30, 32, 16);
+    const skyMat = new THREE.MeshBasicMaterial({
+      color: 0x090d16,
+      side: THREE.BackSide,
+      depthWrite: false,
+    });
+    this.vrSkyDome = new THREE.Mesh(skyGeo, skyMat);
+    this.scene.add(this.vrSkyDome);
   }
 
   /**
@@ -372,18 +384,36 @@ class WebXRGLBViewer {
       const p2 = new THREE.Vector3().setFromMatrixPosition(c2.matrixWorld);
 
       const midpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
-      const angle = Math.atan2(p2.x - p1.x, p2.z - p1.z);
+      const dir = new THREE.Vector3().subVectors(p2, p1).normalize();
+
+      // Average up orientation of both controllers in world space
+      const up1 = new THREE.Vector3(0, 1, 0).applyQuaternion(
+        new THREE.Quaternion().setFromRotationMatrix(c1.matrixWorld)
+      );
+      const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(
+        new THREE.Quaternion().setFromRotationMatrix(c2.matrixWorld)
+      );
+      const avgUp = new THREE.Vector3().addVectors(up1, up2).normalize();
+      const projUp = new THREE.Vector3().copy(avgUp).sub(
+        dir.clone().multiplyScalar(avgUp.dot(dir))
+      );
+      if (projUp.lengthSq() > 0.0001) {
+        projUp.normalize();
+      } else {
+        projUp.set(0, 1, 0);
+      }
 
       this.twoHandState = {
         initialDistance: Math.max(p1.distanceTo(p2), 0.05),
         initialMidpoint: midpoint,
-        initialAngle: angle,
+        initialDir: dir,
+        initialControllerUp: projUp,
         initialModelScale: this.modelRoot.scale.clone(),
         initialModelPos: this.modelRoot.position.clone(),
         initialModelQuat: this.modelRoot.quaternion.clone(),
       };
 
-      this.updateStatus(true, 'Two-Hand Scaling & Rotating');
+      this.updateStatus(true, 'Two-Hand 3D Rotating & Scaling');
     }
   }
 
@@ -411,7 +441,8 @@ class WebXRGLBViewer {
   }
 
   /**
-   * Per-frame manipulation logic during two-hand gestures
+   * Per-frame manipulation logic during two-hand gestures:
+   * Provides simultaneous scaling, translation, and full 3-axis (pitch, yaw, roll) 3D rotation
    */
   private updateTwoHandTransform(): void {
     if (!this.twoHandState || this.activeGrabs.size < 2) return;
@@ -420,31 +451,59 @@ class WebXRGLBViewer {
     const p1 = new THREE.Vector3().setFromMatrixPosition(c1.matrixWorld);
     const p2 = new THREE.Vector3().setFromMatrixPosition(c2.matrixWorld);
 
-    // 1. Dual-hand Pinch / Stretch Scaling (Clamped between 0.05x and 8.0x)
+    // 1. Current geometry between controllers
     const currentDistance = Math.max(p1.distanceTo(p2), 0.05);
-    const scaleRatio = currentDistance / this.twoHandState.initialDistance;
+    const currentMidpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+    const currentDir = new THREE.Vector3().subVectors(p2, p1).normalize();
 
+    // 2. Dual-hand Pinch / Stretch Scaling (Clamped between 0.05x and 8.0x)
+    const scaleRatio = currentDistance / this.twoHandState.initialDistance;
     const baseScale = this.twoHandState.initialModelScale.x;
     const targetScale = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
     this.modelRoot.scale.set(targetScale, targetScale, targetScale);
 
-    // 2. Y-Axis Yaw Rotation between controller line vector
-    const currentAngle = Math.atan2(p2.x - p1.x, p2.z - p1.z);
-    const deltaAngle = currentAngle - this.twoHandState.initialAngle;
-
-    const rotQuat = new THREE.Quaternion().setFromAxisAngle(
-      new THREE.Vector3(0, 1, 0),
-      deltaAngle
+    // 3. FULL 3D ROTATION (Across all 3 axes: Pitch, Yaw, Roll)
+    // A) 3D Direction vector rotation (rotates initialDir to currentDir in 3D space)
+    const qDir = new THREE.Quaternion().setFromUnitVectors(
+      this.twoHandState.initialDir,
+      currentDir
     );
-    this.modelRoot.quaternion.copy(this.twoHandState.initialModelQuat).premultiply(rotQuat);
 
-    // 3. Midpoint translation
-    const currentMidpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
-    const deltaMidpoint = new THREE.Vector3().subVectors(
-      currentMidpoint,
+    // B) Axial roll/twist around the currentDir vector (wrist roll)
+    const up1 = new THREE.Vector3(0, 1, 0).applyQuaternion(
+      new THREE.Quaternion().setFromRotationMatrix(c1.matrixWorld)
+    );
+    const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(
+      new THREE.Quaternion().setFromRotationMatrix(c2.matrixWorld)
+    );
+    const avgUp = new THREE.Vector3().addVectors(up1, up2).normalize();
+    const currentProjUp = new THREE.Vector3().copy(avgUp).sub(
+      currentDir.clone().multiplyScalar(avgUp.dot(currentDir))
+    );
+
+    let qTwist = new THREE.Quaternion();
+    if (currentProjUp.lengthSq() > 0.0001) {
+      currentProjUp.normalize();
+      const transformedInitialUp = this.twoHandState.initialControllerUp.clone().applyQuaternion(qDir);
+      const cross = new THREE.Vector3().crossVectors(transformedInitialUp, currentProjUp);
+      const dot = THREE.MathUtils.clamp(transformedInitialUp.dot(currentProjUp), -1, 1);
+      const twistAngle = Math.atan2(cross.dot(currentDir), dot);
+      qTwist.setFromAxisAngle(currentDir, twistAngle);
+    }
+
+    // Combine direction vector rotation with axial twist
+    const totalRot = new THREE.Quaternion().multiplyQuaternions(qTwist, qDir);
+
+    // Apply 3D rotation to model
+    this.modelRoot.quaternion.copy(totalRot).multiply(this.twoHandState.initialModelQuat);
+
+    // 4. Centroid translation: scales and rotates offset relative to hands midpoint
+    const initialOffset = new THREE.Vector3().subVectors(
+      this.twoHandState.initialModelPos,
       this.twoHandState.initialMidpoint
     );
-    this.modelRoot.position.copy(this.twoHandState.initialModelPos).add(deltaMidpoint);
+    const scaledOffset = initialOffset.clone().multiplyScalar(scaleRatio).applyQuaternion(totalRot);
+    this.modelRoot.position.copy(currentMidpoint).add(scaledOffset);
   }
 
   /**
@@ -671,11 +730,12 @@ class WebXRGLBViewer {
     const btnToggle = document.getElementById('btn-toggle-passthrough');
 
     if (this.isPassthrough) {
-      // PASSTHROUGH MODE: Hide virtual environment, grid, pedestal & fog
+      // PASSTHROUGH MODE: Hide virtual environment, sky dome, grid, pedestal & fog
       // Only the 3D model remains visible over real-world video feed
       this.scene.background = null;
       this.renderer.setClearColor(0x000000, 0);
       this.scene.fog = null;
+      if (this.vrSkyDome) this.vrSkyDome.visible = false;
       if (this.grid) this.grid.visible = false;
       if (this.pedestal) this.pedestal.visible = false;
       if (this.boundingBoxHelper) this.boundingBoxHelper.visible = false;
@@ -693,10 +753,11 @@ class WebXRGLBViewer {
       }
       this.updateStatus(true, 'Passthrough Mode (Real World View)');
     } else {
-      // VR MODE: Restore virtual room void, pedestal, grid & atmospheric fog
+      // VR MODE: Restore full 360 VR sky dome, pedestal, grid & atmospheric fog
       this.scene.background = this.vrBackgroundColor;
       this.renderer.setClearColor(0x090d16, 1);
       this.scene.fog = this.vrFog;
+      if (this.vrSkyDome) this.vrSkyDome.visible = true;
       if (this.grid) this.grid.visible = true;
       if (this.pedestal) this.pedestal.visible = true;
       if (this.boundingBoxHelper) this.boundingBoxHelper.visible = true;
