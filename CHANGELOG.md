@@ -1,0 +1,65 @@
+# 📋 Registro de Seguimiento y Cambios (Changelog)
+
+## 📌 ¿Qué hace esta aplicación?
+**WebXR Spatial GLB Inspector** es una aplicación web progresiva y de alto rendimiento optimizada para el navegador de **Meta Quest 3**. Permite cargar, inspeccionar y transformar modelos 3D (`.glb` / `.gltf`) en el espacio físico real (Realidad Mixta / Passthrough) o en un entorno virtual inmersivo (Realidad Virtual / Void), garantizando:
+
+1. **Anclaje Espacial Absoluto (World-Locking 6DoF):** Al soltar el modelo, este permanece rígidamente fijado en las coordenadas del mundo real, permitiendo caminar físicamente alrededor de él e inspeccionarlo desde cualquier ángulo sin desplazamientos involuntarios ni ataduras a la cámara.
+2. **Manipulación Natural con Mandos:**
+   - **1 Mano (Grip/Trigger):** Traslación y rotación libre en 6 grados de libertad.
+   - **2 Manos (Ambos Grips):** Escalado simétrico mediante distancia entre mandos + **rotación 3D simultánea en los 3 ejes (Pitch, Yaw, Roll)** pivotando sobre el centroide.
+3. **Alternancia Instantánea de Passthrough (Botón A):** Conmutación en tiempo real entre ver tu habitación real con el objeto flotando o un vacío virtual VR completo.
+4. **Deploy Automático en Vercel:** Configuración lista para producción con tipos MIME binarios para modelos 3D y servidor HTTPS local para pruebas en red Wi-Fi.
+
+---
+
+## 📈 Historial Incremental de Cambios
+
+### [v1.2.0] - 2026-10-10
+#### 🚀 Mejoras Clave y Correcciones Críticas
+- **Rotación 3D Completa en los 3 Ejes (Two-Hand Grab):**
+  - Se sustituyó la rotación unidireccional en Y (Yaw) por una formulación matemática completa de cuaterniones 6DoF.
+  - Ahora se descompone el movimiento en:
+    - $Q_{\text{dir}}$: Rotación del vector director entre ambos mandos (permite **Pitch** e **Inclinación** 3D).
+    - $Q_{\text{twist}}$: Torsión axial de muñecas calculada proyectando los vectores normales de los mandos (**Roll**).
+  - El escalado y la rotación pivotan armónicamente alrededor del centroide medio entre ambas manos.
+- **Solución al Retorno a VR (Máscara Circular Ocluida):**
+  - **Problema:** En sesiones `immersive-ar`, WebXR en Quest 3 proyecta la cámara física debajo del buffer y solo los objetos con geometría 3D opaca ocluyen la cámara (el pedestal circular era lo único visible al volver a VR).
+  - **Solución:** Se implementó un **VR Sky Dome** envolvente de 360° (`SphereGeometry(30m)` con caras invertidas `BackSide`). Al apagar el Passthrough, la esfera bloquea el 100% del video de la cámara, devolviendo al usuario al entorno virtual VR completo.
+
+---
+
+### [v1.1.0] - 2026-10-10
+#### ✨ Nuevas Características
+- **Modo Passthrough (Realidad Mixta) con Botón A:**
+  - Integración del botón físico **A** del mando derecho (`buttons[4]` bajo el estándar WebXR `xr-standard`).
+  - Habilitación del modo de sesión `immersive-ar` con canal alfa transparente (`alpha: true`).
+  - Pulso de retroalimentación háptica en el mando al pulsar el Botón A.
+  - Atajos de teclado en PC (`A` / `P`) y botón visual en la interfaz HUD 2D para alternar Passthrough fuera del visor.
+
+---
+
+### [v1.0.0] - 2026-10-10
+#### 🏗️ Arquitectura Inicial y Puesta en Marcha
+- **Estructura Base del Proyecto:**
+  - Configuración de **Vite**, **TypeScript** estricto y **Three.js**.
+  - Plugin `@vitejs/plugin-basic-ssl` con exposición `host: true` para habilitar WebXR sobre HTTPS en la red Wi-Fi local de la Meta Quest 3.
+  - Archivo `vercel.json` con cabeceras de caché y tipo MIME `model/gltf-binary`.
+- **Motor WebXR y Anclaje Espacial:**
+  - Implementación de `modelRoot` y desacoplamiento con `scene.attach()`, logrando World-Locking 6DoF puro.
+  - Configuración del espacio de referencia `'local-floor'`.
+  - Punteros láser visuales con retículas dinámicas y raycasting hacia el modelo 3D.
+  - Carga y normalización automática de modelos (centrado a origen y escala a ~0.65m a nivel de ojos).
+  - Selector de modelos preinstalados (`Van_v02.glb`, `GMC Motorhome`, `sample.glb`) e importador de archivos locales desde el navegador.
+
+---
+
+## 🎮 Mapa Resumen de Controles
+
+| Mando / Entrada | Acción | Función en la App |
+| :--- | :--- | :--- |
+| **Mando Derecho [Botón A]** | Clic simple | Alterna entre **Passthrough (MR)** y **Vacío Virtual (VR)**. |
+| **Cualquier Mando [Grip o Trigger]** | Mantener presionado | Agarra y traslada el modelo en 6DoF con una mano. |
+| **Ambos Mandos [Grip simultáneo]** | Acercar / Alejar manos | **Escalado** con límites de seguridad (`0.05x` a `8.0x`). |
+| **Ambos Mandos [Grip simultáneo]** | Mover / Girar manos | **Rotación 3D total** en los 3 ejes (Pitch, Yaw, Roll). |
+| **Soltar Mandos** | Soltar botones | El objeto se bloquea permanentemente en el espacio (**World-Lock**). |
+| **Teclado PC** | Tecla `A` o `P` | Alterna el modo Passthrough para pruebas de escritorio. |
