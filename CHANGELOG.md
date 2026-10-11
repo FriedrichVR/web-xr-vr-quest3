@@ -14,6 +14,13 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.8.1] - 2026-10-11
+#### 🐛 Fix: Overlay Persistente + Rotación Z Rara a 2 Manos
+- **Overlay eliminado:** el `BoxHelper` (caja wireframe cyan sobre cada modelo) era el overlay persistente — removido por completo (campo, creación, update por frame y toggles de passthrough). El modelo renderiza limpio; el hover-glow ya se apagaba al agarrar.
+- **Rotación Z (causas raíz en el incremental v1.8.0):**
+  - **Efecto palanca:** la rotación giraba el vector completo modelo↔centroid → con offsets de grab por proximidad, girar bamboleaba el modelo en arco. Ahora la rotación gira **en el lugar** (desacoplada); la traslación solo sigue al centroid 1:1 + crecimiento de escala.
+  - **Deriva por ruido acumulado:** los deltas sumaban el jitter de tracking frame a frame (random walk con fuga entre ejes). Deadbands: dirección 0.0003 rad, twist 0.0025 rad — matan frames de puro ruido sin comerse giros lentos intencionales.
+
 ### [v1.8.0] - 2026-10-11
 #### ✨ Sin Overlay al Seleccionar + Rotación/Movimiento Directo estilo Meta
 - **Glow solo en hover:** el highlight se apaga al agarrar/seleccionar el modelo (look limpio durante la manipulación) y vuelve al apuntar en vacío. Restaura el emisivo base como siempre.

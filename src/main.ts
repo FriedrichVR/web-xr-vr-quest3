@@ -242,7 +242,7 @@ class WebXRGLBViewer {
   // Model & Anchoring
   private modelRoot: THREE.Group;
   private normalizedScale: number = 1; // per-model 1.0x reference (scale limits are relative to this)
-  private boundingBoxHelper: THREE.BoxHelper | null = null;
+
   private gltfLoader: GLTFLoader;
   private dracoLoader: DRACOLoader;
   private loadingUI: LoadingUI3D;
@@ -328,6 +328,8 @@ class WebXRGLBViewer {
   private readonly MAX_RATIO_RATE = 8.0;   // Slew limit: ratio units per second (kills spikes, frees fast pinches)
   private readonly DIST_FREEZE_EPS = 0.0004; // Sub-perceptual freeze (0.4mm): kills rest jitter invisibly
   private readonly EMA_ALPHA = 0.45;       // Grip-position EMA: responsive, residual noise caught downstream
+  private readonly DIR_DEADBAND = 0.0003;  // ~0.017°/frame: kills noise frames, keeps slow deliberate turns
+  private readonly TWIST_DEADBAND = 0.0025; // ~0.14°: wrist-roll noise gate (twist is the noisiest channel)
 
   // Desktop / Quest-browser-2D model grab/pan — SINGLE primary button only
   // (button 0: PC left-click == Quest controller trigger). Touch: single finger
@@ -920,8 +922,14 @@ class WebXRGLBViewer {
     // 4. INCREMENTAL 3D ROTATION (Pitch, Yaw, Roll) — Meta-style direct
     // manipulation: this frame's hand delta is applied onto the accumulated
     // target, so the object feels rigidly held (no absolute swim/drift).
+    // Micro-deadband: pure tracking-noise frames are skipped so noise can't
+    // random-walk into drift or leak across axes during single-axis turns.
     // A) Direction-vector delta: prevDir -> current dir
-    this.sQDir.setFromUnitVectors(st.prevDir, this.sDir);
+    if (st.prevDir.angleTo(this.sDir) < this.DIR_DEADBAND) {
+      this.sQDir.identity();
+    } else {
+      this.sQDir.setFromUnitVectors(st.prevDir, this.sDir);
+    }
 
     // B) Axial wrist-roll delta about the current dir (grip-space up vectors)
     this.sQTmp.setFromRotationMatrix(grip1.matrixWorld);
@@ -941,7 +949,7 @@ class WebXRGLBViewer {
       this.sCross.crossVectors(this.sTransUp, this.sProj);
       const dot = THREE.MathUtils.clamp(this.sTransUp.dot(this.sProj), -1, 1);
       const twistAngle = Math.atan2(this.sCross.dot(this.sDir), dot);
-      if (Number.isFinite(twistAngle)) {
+      if (Number.isFinite(twistAngle) && Math.abs(twistAngle) >= this.TWIST_DEADBAND) {
         this.sQTwist.setFromAxisAngle(this.sDir, twistAngle);
       }
     }
@@ -952,11 +960,11 @@ class WebXRGLBViewer {
     if (!Number.isFinite(this.targetQuat.x + this.targetQuat.y + this.targetQuat.z + this.targetQuat.w)) return;
     this.targetQuat.normalize();
 
-    // 5. INCREMENTAL centroid translation: the model offset from the hands
-    // midpoint rides along (rotated by this frame's delta, grown by this
-    // frame's scale change), so moving hands moves the object 1:1.
+    // 5. DECOUPLED translation: rotation spins the model IN PLACE about its
+    // own center (no swing-lever around the hands, even with large grab
+    // offsets); translation purely follows the hands midpoint 1:1, growing
+    // with scale about the centroid as expected for pinch-zoom.
     this.sOff.copy(this.targetPos).sub(st.prevMid);
-    this.sOff.applyQuaternion(this.sQTotal);
     if (st.prevTargetScale > 1e-9) {
       this.sOff.multiplyScalar(targetScaleVal / st.prevTargetScale);
     }
@@ -1117,15 +1125,7 @@ class WebXRGLBViewer {
     // Reset root position to comfortable eye-level viewing height
     this.modelRoot.position.set(0, 1.3, -1.2);
     this.modelRoot.rotation.set(0, 0, 0);
-
-    // Optional subtle bounding box visual helper
-    if (this.boundingBoxHelper) {
-      this.scene.remove(this.boundingBoxHelper);
-    }
-    this.boundingBoxHelper = new THREE.BoxHelper(this.modelRoot, 0x38bdf8);
-    (this.boundingBoxHelper.material as THREE.LineBasicMaterial).transparent = true;
-    (this.boundingBoxHelper.material as THREE.LineBasicMaterial).opacity = 0.25;
-    this.scene.add(this.boundingBoxHelper);
+    // NOTE: no BoxHelper overlay — the model renders clean, no wire cage.
 
     this.updateStatus(true, 'Model Ready • World-Locked');
   }
@@ -1316,7 +1316,6 @@ class WebXRGLBViewer {
       if (this.vrSkyDome) this.vrSkyDome.visible = false;
       if (this.grid) this.grid.visible = false;
       if (this.pedestal) this.pedestal.visible = false;
-      if (this.boundingBoxHelper) this.boundingBoxHelper.visible = false;
 
       if (btnToggle) {
         btnToggle.innerHTML = `
@@ -1338,7 +1337,6 @@ class WebXRGLBViewer {
       if (this.vrSkyDome) this.vrSkyDome.visible = true;
       if (this.grid) this.grid.visible = true;
       if (this.pedestal) this.pedestal.visible = true;
-      if (this.boundingBoxHelper) this.boundingBoxHelper.visible = true;
 
       if (btnToggle) {
         btnToggle.innerHTML = `
@@ -1798,11 +1796,6 @@ class WebXRGLBViewer {
       this.stepRecallAnim(dt);
       this.updateDesktopGamepads(dt);
       if (!this.desktopDrag) this.controls.update();
-    }
-
-    // Update bounding box helper
-    if (this.boundingBoxHelper && this.boundingBoxHelper.visible) {
-      this.boundingBoxHelper.update();
     }
 
     // Aim highlight runs in and out of VR (restores base emissive on exit)
