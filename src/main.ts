@@ -314,7 +314,9 @@ class WebXRGLBViewer {
   private readonly MAX_RATIO_RATE = 3.0;   // Slew limit: ratio units per second (kills spikes, keeps fast gestures)
   private readonly DIST_FREEZE_EPS = 0.0004; // Sub-perceptual freeze (0.4mm): kills rest jitter invisibly
 
-  // Desktop (non-VR) model grab/pan state — mouse left/right or single touch
+  // Desktop / Quest-browser-2D model grab/pan — SINGLE primary button only
+  // (button 0: PC left-click == Quest controller trigger). Touch: single finger
+  // reports button 0, so it flows through the same path automatically.
   private desktopDrag: {
     pointerId: number;
     grabOffset: THREE.Vector3;
@@ -323,6 +325,14 @@ class WebXRGLBViewer {
   private dragNdc = new THREE.Vector2();
   private dragHit = new THREE.Vector3();
   private dragDelta = new THREE.Vector3();
+
+  // Non-VR two-controller scale via Gamepad API (Quest 2D browser only:
+  // no 6DoF poses outside XR, so delta comes from thumbsticks while both
+  // trigger/grip are held). Silently inactive when no pads are exposed.
+  private desktopScale: { ratio: number } | null = null;
+  private readonly DESKTOP_SCALE_RATE = 0.9; // ratio units/sec at full stick deflection
+  private readonly DESKTOP_STICK_DEADZONE = 0.18;
+  private debugPads: boolean = false;
 
   // Status HUD elements
   private statusDot: HTMLElement | null;
@@ -373,7 +383,13 @@ class WebXRGLBViewer {
     this.setupWebXRButton();
 
     // 4. Desktop OrbitControls (disabled automatically during XR sessions)
+    // Explicit button map (== three.js defaults, pinned for PC <-> Quest 2D parity)
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN,
+    };
     this.controls.target.set(0, 1.3, -1.2);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
@@ -1182,45 +1198,66 @@ class WebXRGLBViewer {
   }
 
   /**
-   * Desktop / Quest-browser (non-VR) model grab: left-click, right-click or
-   * single-touch drag on the model pans it across the camera-facing plane.
-   * OrbitControls stay in charge when the press misses the model.
+   * Non-VR model grab (PC mouse == Quest 2D-browser controller laser):
+   * hold the SINGLE primary button (button 0: PC left-click == Quest trigger)
+   * on the model and drag to PAN it across the camera-facing plane.
+   * Capture-phase + stopPropagation so OrbitControls never starts a competing
+   * rotate; a press that misses the model falls through to OrbitControls.
    */
   private setupDesktopGrab(): void {
     const el = this.renderer.domElement;
 
     el.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    el.addEventListener('pointerdown', (e) => {
-      if (this.renderer.xr.isPresenting) return;
-      if (e.button !== 0 && e.button !== 2) return; // left or right grab button
-      if (this.modelRoot.children.length === 0) return;
-      // Second finger/pointer: hand control back to OrbitControls (pinch/rotate)
-      if (this.desktopDrag) {
-        this.desktopDrag = null;
-        this.controls.enabled = true;
-        return;
-      }
+    // NOTE: capture listener lives on the CONTAINER (parent of the canvas):
+    // at-target listeners fire in registration order regardless of capture,
+    // and OrbitControls registered first — only an ancestor capture listener
+    // can intercept before it. HUD elements are siblings, unaffected.
+    this.container.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (this.renderer.xr.isPresenting) return;
+        if (e.button !== 0) return; // single grab button only
+        if (e.target !== el) return; // HUD/VRButton clicks pass through
+        if (this.modelRoot.children.length === 0) return;
+        // Second finger/pointer: hand control back to OrbitControls (pinch/rotate)
+        if (this.desktopDrag) {
+          this.desktopDrag = null;
+          this.controls.enabled = true;
+          return;
+        }
 
-      this.dragNdc.set(
-        (e.clientX / window.innerWidth) * 2 - 1,
-        -(e.clientY / window.innerHeight) * 2 + 1
-      );
-      this.raycaster.setFromCamera(this.dragNdc, this.camera);
-      const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);
-      if (hits.length === 0) return; // missed: OrbitControls handles it
+        this.dragNdc.set(
+          (e.clientX / window.innerWidth) * 2 - 1,
+          -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        this.raycaster.setFromCamera(this.dragNdc, this.camera);
+        const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);
+        if (hits.length === 0) return; // missed: OrbitControls handles it
 
-      // Drag plane: faces the camera through the grab point (screen-space pan)
-      this.camera.getWorldDirection(this.dragDelta);
-      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
-        this.dragDelta.clone(), hits[0].point
-      );
-      const grabOffset = this.modelRoot.position.clone().sub(hits[0].point);
-      this.desktopDrag = { pointerId: e.pointerId, grabOffset, plane };
-      this.controls.enabled = false;
-      el.setPointerCapture(e.pointerId);
-      this.updateStatus(true, 'Desktop Grab • Panning Model');
-    });
+        // Grabbed: claim the gesture before OrbitControls sees it
+        e.stopPropagation();
+        e.preventDefault();
+
+        // Drag plane: faces the camera through the grab point (screen-space pan)
+        this.camera.getWorldDirection(this.dragDelta);
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+          this.dragDelta.clone(),
+          hits[0].point
+        );
+        const grabOffset = this.modelRoot.position.clone().sub(hits[0].point);
+        this.desktopDrag = { pointerId: e.pointerId, grabOffset, plane };
+        this.controls.enabled = false;
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          // capture unsupported: drag still tracks via window-level moves
+        }
+        el.style.cursor = 'grabbing';
+        this.updateStatus(true, 'Desktop Grab • Panning Model');
+      },
+      { capture: true }
+    );
 
     el.addEventListener('pointermove', (e) => {
       if (!this.desktopDrag || e.pointerId !== this.desktopDrag.pointerId) return;
@@ -1232,6 +1269,7 @@ class WebXRGLBViewer {
       );
       this.raycaster.setFromCamera(this.dragNdc, this.camera);
       if (this.raycaster.ray.intersectPlane(this.desktopDrag.plane, this.dragHit)) {
+        if (!Number.isFinite(this.dragHit.x + this.dragHit.y + this.dragHit.z)) return;
         this.modelRoot.position.copy(this.dragHit).add(this.desktopDrag.grabOffset);
         // Keep the model in a sane inspection volume
         this.modelRoot.position.y = Math.max(this.modelRoot.position.y, 0.05);
@@ -1245,14 +1283,130 @@ class WebXRGLBViewer {
       if (!this.desktopDrag || e.pointerId !== this.desktopDrag.pointerId) return;
       this.desktopDrag = null;
       this.controls.enabled = true;
+      el.style.cursor = '';
+      this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+    };
+    const cancelDrag = () => {
+      if (!this.desktopDrag) return;
+      this.desktopDrag = null;
+      this.controls.enabled = true;
+      el.style.cursor = '';
       this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
     };
     el.addEventListener('pointerup', endDrag);
     el.addEventListener('pointercancel', endDrag);
+    el.addEventListener('lostpointercapture', endDrag);
+    window.addEventListener('blur', cancelDrag);
   }
+
+  /**
+   * Non-VR two-controller scale (Quest 2D browser): trigger or grip held on
+   * BOTH controllers enters scale mode; averaged thumbstick Y drives the
+   * ratio (sticks up = grow). No 6DoF poses exist outside XR, so sticks stand
+   * in for hand distance. Silently inactive without exposed gamepads.
+   */
+  private updateDesktopScale(dt: number): void {
+    if (this.renderer.xr.isPresenting) {
+      this.desktopScale = null;
+      return;
+    }
+    const pads: Gamepad[] = [];
+    try {
+      for (const p of navigator.getGamepads()) {
+        if (p && p.connected && p.buttons.length >= 2) pads.push(p);
+      }
+    } catch {
+      this.desktopScale = null;
+      return;
+    }
+
+    const held = pads.filter((p) => this.padGrabHeld(p));
+    if (held.length >= 2) {
+      if (!this.desktopScale) {
+        this.desktopScale = { ratio: 1 };
+        this.updateStatus(true, 'Desktop Scale • Both Triggers + Sticks');
+      }
+      // Thumbstick Y: axes[3] (right stick) preferred, axes[1] fallback
+      let stickSum = 0;
+      for (const p of held) {
+        const y = p.axes.length >= 4 ? p.axes[3] : p.axes[1] ?? 0;
+        stickSum += Number.isFinite(y) ? y : 0;
+      }
+      const avgY = stickSum / held.length;
+      const gated =
+        Math.abs(avgY) < this.DESKTOP_STICK_DEADZONE ? 0 : avgY;
+      if (gated !== 0) {
+        const base = this.modelRoot.scale.x / this.desktopScale.ratio;
+        this.desktopScale.ratio = THREE.MathUtils.clamp(
+          this.desktopScale.ratio - gated * this.DESKTOP_SCALE_RATE * dt,
+          0.05 / Math.max(base, 1e-6),
+          8.0 / Math.max(base, 1e-6)
+        );
+        const s = THREE.MathUtils.clamp(
+          base * this.desktopScale.ratio,
+          0.05,
+          8.0
+        );
+        this.modelRoot.scale.set(s, s, s);
+      }
+    } else if (this.desktopScale) {
+      this.desktopScale = null;
+      this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+    }
+
+    if (this.debugPads) this.renderPadDebug(pads);
+  }
+
+  /** Trigger (btn 0) or squeeze/grip (btn 1), xr-standard mapping. */
+  private padGrabHeld(pad: Gamepad): boolean {
+    const b0 = pad.buttons[0];
+    const b1 = pad.buttons[1];
+    return (
+      !!b0 && (b0.pressed || b0.value > 0.5)
+    ) || (
+      !!b1 && (b1.pressed || b1.value > 0.5)
+    );
+  }
+
+  /** ?debugpads=1 overlay: live gamepad snapshot to confirm Quest mapping. */
+  private renderPadDebug(pads: Gamepad[]): void {
+    let el = document.getElementById('pad-debug');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'pad-debug';
+      el.style.cssText =
+        'position:absolute;bottom:84px;right:24px;z-index:50;max-width:46vw;' +
+        'background:rgba(0,0,0,0.72);color:#7dd3fc;font:11px/1.5 monospace;' +
+        'padding:8px 10px;border-radius:8px;white-space:pre-wrap;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    const now = performance.now();
+    if (now - (this.padDebugLast ?? 0) < 200) return;
+    this.padDebugLast = now;
+    if (pads.length === 0) {
+      el.textContent = 'pads: none — press any controller button once';
+      return;
+    }
+    el.textContent = pads
+      .map((p, i) => {
+        const btns = p.buttons
+          .map((b, bi) => (b.pressed || b.value > 0.05 ? `${bi}:${b.value.toFixed(2)}` : null))
+          .filter(Boolean)
+          .join(' ');
+        const axes = p.axes.map((a) => a.toFixed(2)).join(',');
+        return `#${i} ${p.id.slice(0, 28)} map=${p.mapping}\n  btn[${btns || '-'}] ax[${axes}]`;
+      })
+      .join('\n');
+  }
+  private padDebugLast: number = 0;
 
   private setupEventListeners(): void {
     this.setupDesktopGrab();
+    try {
+      this.debugPads = new URLSearchParams(window.location.search).has('debugpads');
+    } catch {
+      this.debugPads = false;
+    }
     window.addEventListener('resize', this.onWindowResize.bind(this));
 
     // Keyboard shortcut 'A' or 'P' to toggle passthrough on desktop
@@ -1274,6 +1428,7 @@ class WebXRGLBViewer {
     this.renderer.xr.addEventListener('sessionstart', () => {
       this.updateStatus(true, 'Immersive Session Active • Quest 3');
       this.desktopDrag = null;
+      this.desktopScale = null;
       this.controls.enabled = false;
     });
 
@@ -1327,7 +1482,8 @@ class WebXRGLBViewer {
         this.hasTarget = false;
       }
     } else {
-      this.controls.update();
+      this.updateDesktopScale(dt);
+      if (!this.desktopDrag) this.controls.update();
     }
 
     // Update bounding box helper

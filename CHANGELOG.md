@@ -14,6 +14,20 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.5.0] - 2026-10-11
+#### 🖱️ Paridad Total Quest-2D = Mouse PC + Escala 2-Mandos sin VR (VR intacto)
+- **PAN con UN solo botón de grab (botón 0 = click izq PC = trigger Quest):**
+  - Se eliminó el grab con botón derecho: mantener el primario **sobre el modelo** = PAN 1:1 en plano facing-cámara; fuera del modelo = órbita OrbitControls. Idéntico en PC y browser 2D del Quest.
+  - Intercepción en **fase capture sobre el contenedor padre** + `stopPropagation`: OrbitControls (registrado primero) ya no arranca un ROTATE fantasma al agarrar (antes dependíamos de un detalle de la v160).
+  - `mouseButtons` de OrbitControls fijados explícitos (LEFT órbita / MIDDLE zoom / RIGHT pan).
+  - Cierre de drag robusto: `pointerup` + `pointercancel` + `lostpointercapture` + `blur`; `setPointerCapture` en try/catch; guard anti-NaN; cursor `grabbing`.
+  - Touch single-finger fluye por el mismo path (reporta botón 0); segundo dedo cede a OrbitControls.
+- **Escala sin VR con 2 mandos (Gamepad API):**
+  - Trigger o grip en **ambos** mandos = modo escala; thumbstick Y promediado (arriba = agrandar) con zona muerta 0.18, tasa 0.9 ratio/s, clamp 0.05–8 (mismo rango que VR).
+  - Sin poses 6DoF fuera de XR: los sticks reemplazan la distancia entre manos; integración por `dt` = continuo, sin escalones. Inactivo silencioso sin gamepads (PC-mouse inalterado).
+  - Overlay debug `?debugpads=1` con snapshot en vivo (ids, botones, ejes) para confirmar el mapeo real del Quest Browser.
+- **VR inmersivo sin cambios** (grips, EMA, cascada de escala, world-lock intactos).
+
 ### [v1.4.0] - 2026-10-11
 #### 🗜️ Soporte Draco + 📊 Loading UI 3D en Escena
 - **Descompresión Draco (`DRACOLoader` 1.5.6):**
