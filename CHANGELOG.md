@@ -28,6 +28,16 @@
 
 ---
 
+### [v1.2.1] - 2026-10-11
+#### 🎯 Optimización de Fluidez en Manipulación
+- **Suavizado Exponencial Frame-Rate Independent (Two-Hand Grab):**
+  - Implementación de interpolación exponencial (lerp/slerp) en posición, rotación y escala durante manipulación a dos manos.
+  - Cálculo de `deltaTime` real en el loop de render para suavizado independiente de FPS (72Hz Quest 3 / 90Hz PC).
+  - Factor de suavizado `k=25` configurable: elimina jitter de tracking sin lag perceptible.
+  - Reutilización de objetos `THREE.Vector3`/`Quaternion` para evitar presión en Garbage Collector y frame drops.
+
+---
+
 ### [v1.1.0] - 2026-10-10
 #### ✨ Nuevas Características
 - **Modo Passthrough (Realidad Mixta) con Botón A:**
