@@ -59,6 +59,20 @@ class WebXRGLBViewer {
     initialModelQuat: THREE.Quaternion;
   } | null = null;
 
+  // Smoothing state
+  private lastTimestamp: number = 0;
+  private targetPos = new THREE.Vector3();
+  private targetQuat = new THREE.Quaternion();
+  private targetScale = new THREE.Vector3();
+  private hasTarget: boolean = false;
+
+  // Reusable vectors/quaternions to avoid GC pressure
+  private tmpVec1 = new THREE.Vector3();
+  private tmpVec2 = new THREE.Vector3();
+  private tmpVec3 = new THREE.Vector3();
+  private tmpQuat1 = new THREE.Quaternion();
+  private tmpQuat2 = new THREE.Quaternion();
+
   // Status HUD elements
   private statusDot: HTMLElement | null;
   private statusText: HTMLElement | null;
@@ -442,68 +456,72 @@ class WebXRGLBViewer {
 
   /**
    * Per-frame manipulation logic during two-hand gestures:
-   * Provides simultaneous scaling, translation, and full 3-axis (pitch, yaw, roll) 3D rotation
+   * Computes target transform for smoothing
    */
   private updateTwoHandTransform(): void {
     if (!this.twoHandState || this.activeGrabs.size < 2) return;
 
     const [c1, c2] = Array.from(this.activeGrabs.keys());
-    const p1 = new THREE.Vector3().setFromMatrixPosition(c1.matrixWorld);
-    const p2 = new THREE.Vector3().setFromMatrixPosition(c2.matrixWorld);
+
+    // Reuse vectors to avoid allocations
+    const p1 = this.tmpVec1.setFromMatrixPosition(c1.matrixWorld);
+    const p2 = this.tmpVec2.setFromMatrixPosition(c2.matrixWorld);
 
     // 1. Current geometry between controllers
     const currentDistance = Math.max(p1.distanceTo(p2), 0.05);
-    const currentMidpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
-    const currentDir = new THREE.Vector3().subVectors(p2, p1).normalize();
+    const currentMidpoint = this.tmpVec3.addVectors(p1, p2).multiplyScalar(0.5);
+    const currentDir = this.tmpVec1.subVectors(p2, p1).normalize();
 
     // 2. Dual-hand Pinch / Stretch Scaling (Clamped between 0.05x and 8.0x)
     const scaleRatio = currentDistance / this.twoHandState.initialDistance;
     const baseScale = this.twoHandState.initialModelScale.x;
-    const targetScale = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
-    this.modelRoot.scale.set(targetScale, targetScale, targetScale);
+    const targetScaleVal = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
+    this.targetScale.set(targetScaleVal, targetScaleVal, targetScaleVal);
 
     // 3. FULL 3D ROTATION (Across all 3 axes: Pitch, Yaw, Roll)
     // A) 3D Direction vector rotation (rotates initialDir to currentDir in 3D space)
-    const qDir = new THREE.Quaternion().setFromUnitVectors(
+    const qDir = this.tmpQuat1.setFromUnitVectors(
       this.twoHandState.initialDir,
       currentDir
     );
 
     // B) Axial roll/twist around the currentDir vector (wrist roll)
-    const up1 = new THREE.Vector3(0, 1, 0).applyQuaternion(
-      new THREE.Quaternion().setFromRotationMatrix(c1.matrixWorld)
+    const up1 = this.tmpVec1.set(0, 1, 0).applyQuaternion(
+      this.tmpQuat2.setFromRotationMatrix(c1.matrixWorld)
     );
-    const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(
-      new THREE.Quaternion().setFromRotationMatrix(c2.matrixWorld)
+    const up2 = this.tmpVec2.set(0, 1, 0).applyQuaternion(
+      this.tmpQuat2.setFromRotationMatrix(c2.matrixWorld)
     );
-    const avgUp = new THREE.Vector3().addVectors(up1, up2).normalize();
-    const currentProjUp = new THREE.Vector3().copy(avgUp).sub(
-      currentDir.clone().multiplyScalar(avgUp.dot(currentDir))
+    const avgUp = this.tmpVec1.addVectors(up1, up2).normalize();
+    const currentProjUp = this.tmpVec2.copy(avgUp).sub(
+      this.tmpVec3.copy(currentDir).multiplyScalar(avgUp.dot(currentDir))
     );
 
-    let qTwist = new THREE.Quaternion();
+    let qTwist = this.tmpQuat2.identity();
     if (currentProjUp.lengthSq() > 0.0001) {
       currentProjUp.normalize();
       const transformedInitialUp = this.twoHandState.initialControllerUp.clone().applyQuaternion(qDir);
-      const cross = new THREE.Vector3().crossVectors(transformedInitialUp, currentProjUp);
+      const cross = this.tmpVec1.crossVectors(transformedInitialUp, currentProjUp);
       const dot = THREE.MathUtils.clamp(transformedInitialUp.dot(currentProjUp), -1, 1);
       const twistAngle = Math.atan2(cross.dot(currentDir), dot);
       qTwist.setFromAxisAngle(currentDir, twistAngle);
     }
 
     // Combine direction vector rotation with axial twist
-    const totalRot = new THREE.Quaternion().multiplyQuaternions(qTwist, qDir);
+    const totalRot = this.tmpQuat1.multiplyQuaternions(qTwist, qDir);
 
-    // Apply 3D rotation to model
-    this.modelRoot.quaternion.copy(totalRot).multiply(this.twoHandState.initialModelQuat);
+    // Compute target rotation
+    this.targetQuat.copy(totalRot).multiply(this.twoHandState.initialModelQuat);
 
     // 4. Centroid translation: scales and rotates offset relative to hands midpoint
-    const initialOffset = new THREE.Vector3().subVectors(
+    const initialOffset = this.tmpVec1.subVectors(
       this.twoHandState.initialModelPos,
       this.twoHandState.initialMidpoint
     );
-    const scaledOffset = initialOffset.clone().multiplyScalar(scaleRatio).applyQuaternion(totalRot);
-    this.modelRoot.position.copy(currentMidpoint).add(scaledOffset);
+    const scaledOffset = this.tmpVec2.copy(initialOffset).multiplyScalar(scaleRatio).applyQuaternion(totalRot);
+    this.targetPos.copy(currentMidpoint).add(scaledOffset);
+
+    this.hasTarget = true;
   }
 
   /**
@@ -856,12 +874,30 @@ class WebXRGLBViewer {
   /**
    * Main WebXR animation and render loop
    */
-  private render(): void {
+  private render(timestamp: number, frame: XRFrame | null): void {
+    // Calculate deltaTime for frame-rate independent smoothing
+    const dt = this.lastTimestamp > 0 ? Math.min((timestamp - this.lastTimestamp) / 1000, 1 / 30) : 1 / 72;
+    this.lastTimestamp = timestamp;
+
     // Process XR inputs and transformations if active
     if (this.renderer.xr.isPresenting) {
       this.checkControllerButtons();
       this.updateTwoHandTransform();
       this.updateControllerRays();
+
+      // Apply exponential smoothing for fluid two-hand manipulation
+      if (this.hasTarget && this.activeGrabs.size === 2) {
+        // Smoothing factor (higher = snappier, lower = smoother)
+        // 1 - exp(-k * dt) gives frame-rate independent lerp factor
+        const k = 25; // Adjust: 15-20 for more smoothing, 30-40 for more responsive
+        const alpha = 1 - Math.exp(-k * dt);
+
+        this.modelRoot.position.lerp(this.targetPos, alpha);
+        this.modelRoot.quaternion.slerp(this.targetQuat, alpha);
+        this.modelRoot.scale.lerp(this.targetScale, alpha);
+      } else {
+        this.hasTarget = false;
+      }
     } else {
       this.controls.update();
     }
