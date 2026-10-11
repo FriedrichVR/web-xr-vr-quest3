@@ -14,6 +14,17 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.9.0] - 2026-10-11
+#### ✨ Sin Hover-Glow + Rotación Reactiva + Optimizador de Geometría VR
+- **Eliminado el overlay de OnHover:** fuera todo el sistema de hover-glow (constante, campos, cache de materiales, update por frame). El asset renderiza siempre limpio; solo quedan retícula láser y rayos.
+- **Rotación a 2 manos más reactiva al mando:**
+  - El quaternion ahora se **aplica directo** (los deltas incrementales son exactos por frame: cero lag agregado); posición/escala mantienen su ease.
+  - EMA `0.45 → 0.6` (asienta en ~1 frame) y deadbands más finos (dir 0.00015, twist 0.0015): respuesta inmediata sin devolver el ruido.
+- **Optimizador de geometría (`optimizeModelGeometry`):**
+  - Fusiona meshes estáticos por material (transforms horneados) en un draw call por grupo; skinned/morph/multi-material intactos; fallback a originales si hay mismatch de atributos; corre pre-normalización (preserva forma).
+  - Log `geometry merge: N meshes -> M draw calls` en consola por modelo.
+- **Foveated rendering fijo al máximo** (`setFoveation(1.0)`): ahorro grande de GPU en Quest 3, pérdida solo en periferia lejana.
+
 ### [v1.8.1] - 2026-10-11
 #### 🐛 Fix: Overlay Persistente + Rotación Z Rara a 2 Manos
 - **Overlay eliminado:** el `BoxHelper` (caja wireframe cyan sobre cada modelo) era el overlay persistente — removido por completo (campo, creación, update por frame y toggles de passthrough). El modelo renderiza limpio; el hover-glow ya se apagaba al agarrar.

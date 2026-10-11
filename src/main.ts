@@ -3,9 +3,7 @@ import { XRControllerModelFactory } from 'three/examples/jsm/webxr/XRControllerM
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-
-/** Sky-blue additive tint for the aim-hover glow on grabbable models. */
-const HOVER_GLOW = new THREE.Color(0x38bdf8);
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 /**
  * World-locked 3D loading overlay: progress bar + canvas status text.
@@ -322,14 +320,14 @@ class WebXRGLBViewer {
   // Scale path tuned for LOW LATENCY: fast stages, anti-step guards kept
   // (freeze-eps + slew limit) so responsiveness doesn't bring back steps.
   private readonly SMOOTH_K_SCALE = 35;    // Final scale ease (input already smoothed upstream)
-  private readonly SMOOTH_K_POS_ROT = 30;  // Tight tracking of exact incremental targets
+  private readonly SMOOTH_K_POS = 30;      // Position ease (rotation applies directly)
   private readonly SMOOTH_K_DIST = 25;     // Stage 1: smooths raw hand distance (jitter filter)
   private readonly SMOOTH_K_RATIO = 22;    // Stage 2: smooths scale ratio (removes steps)
   private readonly MAX_RATIO_RATE = 8.0;   // Slew limit: ratio units per second (kills spikes, frees fast pinches)
   private readonly DIST_FREEZE_EPS = 0.0004; // Sub-perceptual freeze (0.4mm): kills rest jitter invisibly
-  private readonly EMA_ALPHA = 0.45;       // Grip-position EMA: responsive, residual noise caught downstream
-  private readonly DIR_DEADBAND = 0.0003;  // ~0.017°/frame: kills noise frames, keeps slow deliberate turns
-  private readonly TWIST_DEADBAND = 0.0025; // ~0.14°: wrist-roll noise gate (twist is the noisiest channel)
+  private readonly EMA_ALPHA = 0.6;        // Grip-position EMA: near-direct, residual noise caught downstream
+  private readonly DIR_DEADBAND = 0.00015; // tight gate: reactivity first, still kills pure-noise frames
+  private readonly TWIST_DEADBAND = 0.0015; // wrist-roll gate, lowered with the faster pipeline
 
   // Desktop / Quest-browser-2D model grab/pan — SINGLE primary button only
   // (button 0: PC left-click == Quest controller trigger). Touch: single finger
@@ -354,9 +352,8 @@ class WebXRGLBViewer {
   private readonly DESKTOP_STICK_DEADZONE = 0.18;
   private debugPads: boolean = false;
 
-  // VR UX package: aim highlight, scale haptics, bring-to-me, B/Y reset
-  private aimHover: boolean = false;
-  private highlightMats: { mat: THREE.MeshStandardMaterial; base: THREE.Color }[] = [];
+  // VR UX package: scale haptics, bring-to-me, B/Y reset
+  // (no hover glow / overlays on the asset by design)
   private lastTapTime: number[] = [0, 0];
   private readonly DOUBLE_TAP_MS = 350;
   private recallAnim: { from: THREE.Vector3; to: THREE.Vector3; t: number } | null = null;
@@ -411,6 +408,13 @@ class WebXRGLBViewer {
     // Enable WebXR
     this.renderer.xr.enabled = true;
     this.renderer.xr.setReferenceSpaceType('local-floor');
+    // Fixed foveated rendering (max): big GPU saving on Quest 3, quality
+    // loss only in far periphery where the lenses blur anyway
+    try {
+      this.renderer.xr.setFoveation(1.0);
+    } catch {
+      // older three / non-XR browsers: ignore
+    }
     this.container.appendChild(this.renderer.domElement);
 
     // Setup WebXR Session Button (supports immersive-ar on Quest 3 for native passthrough)
@@ -1030,38 +1034,76 @@ class WebXRGLBViewer {
       if (!hit) {
         reticle.visible = false;
       }
-      if (hit) this.aimHover = true;
     }
   }
 
   /**
-   * Aim highlight: pulse emissive while a ray hovers the model, OFF while
-   * grabbed/selected (clean look during manipulation) and otherwise.
-   * Restores each material's base emissive.
+   * Geometry optimizer for VR: merges static meshes sharing the same material
+   * (transforms baked) into single draw calls. Skinned/morphed meshes and
+   * multi-material meshes are left untouched. Attribute-mismatched groups
+   * fall back to their originals. Runs pre-normalization (shape-preserving).
    */
-  private glowWasActive: boolean = false;
-
-  private updateHoverHighlight(timestamp: number): void {
-    if (this.highlightMats.length === 0) return;
-    // Hover glow only: no overlay once the model is selected/grabbed
-    const active = this.aimHover && this.activeGrabs.size === 0;
-    if (!active && !this.glowWasActive) {
-      this.aimHover = false;
-      return; // already at base emissive: skip uniform writes
-    }
-    this.glowWasActive = active;
-    const pulse = 0.22 + 0.13 * Math.sin(timestamp / 1000 * 6);
-    for (const e of this.highlightMats) {
-      if (!active) {
-        e.mat.emissive.copy(e.base);
-        e.mat.emissiveIntensity = 1;
-      } else {
-        // Additive sky-blue glow over the author's base emissive
-        e.mat.emissive.copy(e.base).lerp(HOVER_GLOW, 0.55);
-        e.mat.emissiveIntensity = 1 + pulse;
+  private optimizeModelGeometry(object: THREE.Object3D): void {
+    object.updateMatrixWorld(true);
+    const buckets = new Map<
+      string,
+      { mat: THREE.Material; geos: THREE.BufferGeometry[]; src: THREE.Mesh[] }
+    >();
+    let meshCount = 0;
+    object.traverse((child) => {
+      if (!(child as THREE.Mesh).isMesh) return;
+      const mesh = child as THREE.Mesh;
+      if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) return; // animated: keep
+      const geo = mesh.geometry as THREE.BufferGeometry | undefined;
+      if (!geo || !geo.attributes.position) return;
+      if (Array.isArray(mesh.material)) return; // multi-material groups: keep
+      if ((geo.morphAttributes['position']?.length ?? 0) > 0) return;
+      meshCount++;
+      const key =
+        `${(mesh.material as THREE.Material).uuid}|` +
+        `${Object.keys(geo.attributes).sort().join(',')}|${geo.index ? 'i' : 'ni'}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = { mat: mesh.material as THREE.Material, geos: [], src: [] };
+        buckets.set(key, bucket);
       }
+      bucket.geos.push(geo.clone().applyMatrix4(mesh.matrixWorld));
+      bucket.src.push(mesh);
+    });
+
+    let mergedGroups = 0;
+    for (const bucket of buckets.values()) {
+      if (bucket.geos.length < 2) {
+        bucket.geos.forEach((g) => g.dispose());
+        continue;
+      }
+      const merged = mergeGeometries(bucket.geos, false);
+      bucket.geos.forEach((g) => g.dispose());
+      if (!merged) continue; // incompatible attributes: keep originals
+      const disposed = new Set<THREE.BufferGeometry>();
+      for (const m of bucket.src) {
+        m.removeFromParent();
+        const g = m.geometry as THREE.BufferGeometry;
+        if (!disposed.has(g)) {
+          disposed.add(g);
+          g.dispose();
+        }
+      }
+      const mergedMesh = new THREE.Mesh(merged, bucket.mat);
+      mergedMesh.castShadow = true;
+      mergedMesh.receiveShadow = true;
+      object.add(mergedMesh);
+      mergedGroups++;
     }
-    this.aimHover = false; // re-armed by updateControllerRays each frame
+
+    if (mergedGroups > 0) {
+      let after = 0;
+      object.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) after++;
+      });
+      object.updateMatrixWorld(true);
+      console.info(`[Models] geometry merge: ${meshCount} meshes -> ${after} draw calls`);
+    }
   }
 
   /**
@@ -1073,25 +1115,17 @@ class WebXRGLBViewer {
       this.modelRoot.remove(this.modelRoot.children[0]);
     }
 
-    // Enable shadows on all child meshes + cache emissive-capable materials
-    // for the aim highlight (hover glow)
-    this.highlightMats = [];
+    // Enable shadows on all child meshes
     object.traverse((child) => {
       if ((child as THREE.Mesh).isMesh) {
         const mesh = child as THREE.Mesh;
         mesh.castShadow = true;
         mesh.receiveShadow = true;
-        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        for (const m of mats) {
-          const std = m as THREE.MeshStandardMaterial;
-          if (std && 'emissive' in std && std.emissive instanceof THREE.Color) {
-            if (!this.highlightMats.some((e) => e.mat === std)) {
-              this.highlightMats.push({ mat: std, base: std.emissive.clone() });
-            }
-          }
-        }
       }
     });
+
+    // Merge static geometry per material: fewer draw calls, smoother VR
+    this.optimizeModelGeometry(object);
 
     // Compute bounding box
     const bbox = new THREE.Box3().setFromObject(object);
@@ -1780,14 +1814,15 @@ class WebXRGLBViewer {
       this.updateTwoHandTransform(dt);
       this.updateControllerRays();
 
-      // Apply exponential smoothing for fluid two-hand manipulation
-      // Separate factors: scale more responsive, position/rotation smoother (Meta UX guidelines)
+      // Two-hand application: rotation copies DIRECTLY (incremental deltas
+      // are exact per-frame — zero added lag, maximally reactive to the
+      // controllers); position/scale keep their exponential ease.
       if (this.hasTarget && this.activeGrabs.size === 2) {
         const alphaScale = 1 - Math.exp(-this.SMOOTH_K_SCALE * dt);
-        const alphaPosRot = 1 - Math.exp(-this.SMOOTH_K_POS_ROT * dt);
+        const alphaPos = 1 - Math.exp(-this.SMOOTH_K_POS * dt);
 
-        this.modelRoot.position.lerp(this.targetPos, alphaPosRot);
-        this.modelRoot.quaternion.slerp(this.targetQuat, alphaPosRot);
+        this.modelRoot.position.lerp(this.targetPos, alphaPos);
+        this.modelRoot.quaternion.copy(this.targetQuat);
         this.modelRoot.scale.lerp(this.targetScale, alphaScale);
       } else {
         this.hasTarget = false;
@@ -1797,9 +1832,6 @@ class WebXRGLBViewer {
       this.updateDesktopGamepads(dt);
       if (!this.desktopDrag) this.controls.update();
     }
-
-    // Aim highlight runs in and out of VR (restores base emissive on exit)
-    this.updateHoverHighlight(timestamp);
 
     // In-scene loading overlay: billboard, indeterminate pulse, auto fade
     this.loadingUI.tick(timestamp, this.camera, dt);
