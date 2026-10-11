@@ -14,6 +14,14 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.2.3] - 2026-10-11
+#### 🐛 Fix Crítico: Modelo Desaparece al Escalar/Rotar a 2 Manos
+- **Causa:** aliasing de vectores temporales reutilizados (`tmpVec1/2/3`): `midpoint`, `dir` y `up` se sobrescribían entre sí en el mismo frame, corrompiendo `twoHandState` inicial y el target por frame (NaN / offsets gigantes).
+- **Solución:**
+  - Scratch dedicados por rol (`sRaw1/2`, `sMid`, `sDir`, `sUp1/2`, `sAvg`, `sProj`, `sOff`, `sQDir`, `sQTwist`, `sQTotal`) — ningún valor vivo comparte variable.
+  - Inicialización del grab a 2 manos con vectores locales frescos (corre una vez, sin riesgo).
+  - Guards anti-NaN: skip del frame si `dir` degenera, si el quaternion/target no son finitos, y clamp de `targetPos` a 20m para que el modelo nunca "salga volando".
+
 ### [v1.2.0] - 2026-10-10
 #### 🚀 Mejoras Clave y Correcciones Críticas
 - **Rotación 3D Completa en los 3 Ejes (Two-Hand Grab):**

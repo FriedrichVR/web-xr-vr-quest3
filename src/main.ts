@@ -70,12 +70,23 @@ class WebXRGLBViewer {
   private targetScale = new THREE.Vector3();
   private hasTarget: boolean = false;
 
-  // Reusable vectors/quaternions to avoid GC pressure
-  private tmpVec1 = new THREE.Vector3();
-  private tmpVec2 = new THREE.Vector3();
-  private tmpVec3 = new THREE.Vector3();
-  private tmpQuat1 = new THREE.Quaternion();
-  private tmpQuat2 = new THREE.Quaternion();
+  // Dedicated scratch objects (one per role — NEVER alias two live values in the same var)
+  private sRaw1 = new THREE.Vector3();
+  private sRaw2 = new THREE.Vector3();
+  private sMid = new THREE.Vector3();
+  private sDir = new THREE.Vector3();
+  private sUp1 = new THREE.Vector3();
+  private sUp2 = new THREE.Vector3();
+  private sAvg = new THREE.Vector3();
+  private sProj = new THREE.Vector3();
+  private sOff = new THREE.Vector3();
+  private sOff2 = new THREE.Vector3();
+  private sCross = new THREE.Vector3();
+  private sTransUp = new THREE.Vector3();
+  private sQDir = new THREE.Quaternion();
+  private sQTwist = new THREE.Quaternion();
+  private sQTotal = new THREE.Quaternion();
+  private sQTmp = new THREE.Quaternion();
 
   // Smoothing constants (Meta Quest 3 best practices)
   private readonly SMOOTH_K_SCALE = 38;    // Scale: more responsive, less smoothing
@@ -407,25 +418,25 @@ class WebXRGLBViewer {
       const idx2 = c2.userData.index as number;
 
       // Use GRIP SPACE (physical controller pose) for manipulation - Meta best practice
+      // NOTE: fresh locals here (runs once per grab, no perf concern) to avoid any aliasing bugs
       const grip1 = this.controllerGrips[idx1];
       const grip2 = this.controllerGrips[idx2];
-      const p1 = this.tmpVec1.setFromMatrixPosition(grip1.matrixWorld);
-      const p2 = this.tmpVec2.setFromMatrixPosition(grip2.matrixWorld);
+      const p1 = new THREE.Vector3().setFromMatrixPosition(grip1.matrixWorld);
+      const p2 = new THREE.Vector3().setFromMatrixPosition(grip2.matrixWorld);
 
-      const midpoint = this.tmpVec3.addVectors(p1, p2).multiplyScalar(0.5);
-      const dir = this.tmpVec1.subVectors(p2, p1).normalize();
+      const dist = Math.max(p1.distanceTo(p2), 0.05);
+      const midpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+      const dir = new THREE.Vector3().subVectors(p2, p1).normalize();
 
       // Average up orientation of both controllers in world space (from grip space)
-      const up1 = this.tmpVec1.set(0, 1, 0).applyQuaternion(
-        this.tmpQuat1.setFromRotationMatrix(grip1.matrixWorld)
-      );
-      const up2 = this.tmpVec2.set(0, 1, 0).applyQuaternion(
-        this.tmpQuat1.setFromRotationMatrix(grip2.matrixWorld)
-      );
-      const avgUp = this.tmpVec1.addVectors(up1, up2).normalize();
-      const projUp = this.tmpVec2.copy(avgUp).sub(
-        this.tmpVec3.copy(dir).multiplyScalar(avgUp.dot(dir))
-      );
+      const q1 = new THREE.Quaternion().setFromRotationMatrix(grip1.matrixWorld);
+      const q2 = new THREE.Quaternion().setFromRotationMatrix(grip2.matrixWorld);
+      const up1 = new THREE.Vector3(0, 1, 0).applyQuaternion(q1);
+      const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(q2);
+      const avgUp = new THREE.Vector3().addVectors(up1, up2);
+      if (avgUp.lengthSq() < 1e-8) avgUp.set(0, 1, 0);
+      avgUp.normalize();
+      const projUp = avgUp.clone().sub(dir.clone().multiplyScalar(avgUp.dot(dir)));
       if (projUp.lengthSq() > 0.0001) {
         projUp.normalize();
       } else {
@@ -436,7 +447,7 @@ class WebXRGLBViewer {
       const emaAlpha = 0.15;
 
       this.twoHandState = {
-        initialDistance: Math.max(p1.distanceTo(p2), 0.05),
+        initialDistance: dist,
         initialMidpoint: midpoint.clone(),
         initialDir: dir.clone(),
         initialControllerUp: projUp.clone(),
@@ -491,25 +502,30 @@ class WebXRGLBViewer {
     const grip1 = this.controllerGrips[idx1];
     const grip2 = this.controllerGrips[idx2];
 
-    // Get raw grip positions
-    const rawP1 = this.tmpVec1.setFromMatrixPosition(grip1.matrixWorld);
-    const rawP2 = this.tmpVec2.setFromMatrixPosition(grip2.matrixWorld);
+    // Get raw grip positions (dedicated scratch, no aliasing)
+    this.sRaw1.setFromMatrixPosition(grip1.matrixWorld);
+    this.sRaw2.setFromMatrixPosition(grip2.matrixWorld);
+    if (!Number.isFinite(this.sRaw1.lengthSq() + this.sRaw2.lengthSq())) return;
 
     // 1. EMA filtering on controller positions (filters tracking jitter at source)
     const alpha = this.twoHandState.emaAlpha;
-    this.twoHandState.filteredP1.lerp(rawP1, alpha);
-    this.twoHandState.filteredP2.lerp(rawP2, alpha);
+    this.twoHandState.filteredP1.lerp(this.sRaw1, alpha);
+    this.twoHandState.filteredP2.lerp(this.sRaw2, alpha);
 
     const p1 = this.twoHandState.filteredP1;
     const p2 = this.twoHandState.filteredP2;
 
     // 2. Current geometry between FILTERED controller positions
     const currentDistance = Math.max(p1.distanceTo(p2), 0.05);
-    const currentMidpoint = this.tmpVec3.addVectors(p1, p2).multiplyScalar(0.5);
-    const currentDir = this.tmpVec1.subVectors(p2, p1).normalize();
+    this.sMid.addVectors(p1, p2).multiplyScalar(0.5);
+    this.sDir.subVectors(p2, p1);
+    if (this.sDir.lengthSq() < 1e-10) return; // hands on top of each other: skip frame
+    this.sDir.normalize();
 
     // 3. Dual-hand Pinch / Stretch Scaling with DEAD ZONE (prevents micro-jitter)
-    const scaleRatio = currentDistance / this.twoHandState.initialDistance;
+    const scaleRatio = THREE.MathUtils.clamp(
+      currentDistance / this.twoHandState.initialDistance, 0.05, 8.0
+    );
     const baseScale = this.twoHandState.initialModelScale.x;
     let targetScaleVal = baseScale * scaleRatio;
 
@@ -523,46 +539,49 @@ class WebXRGLBViewer {
 
     // 4. FULL 3D ROTATION (Pitch, Yaw, Roll) using filtered orientations
     // A) 3D Direction vector rotation
-    const qDir = this.tmpQuat1.setFromUnitVectors(
-      this.twoHandState.initialDir,
-      currentDir
-    );
+    this.sQDir.setFromUnitVectors(this.twoHandState.initialDir, this.sDir);
 
-    // B) Axial roll/twist around currentDir vector (wrist roll) - using grip space orientation
-    const up1 = this.tmpVec1.set(0, 1, 0).applyQuaternion(
-      this.tmpQuat2.setFromRotationMatrix(grip1.matrixWorld)
-    );
-    const up2 = this.tmpVec2.set(0, 1, 0).applyQuaternion(
-      this.tmpQuat2.setFromRotationMatrix(grip2.matrixWorld)
-    );
-    const avgUp = this.tmpVec1.addVectors(up1, up2).normalize();
-    const currentProjUp = this.tmpVec2.copy(avgUp).sub(
-      this.tmpVec3.copy(currentDir).multiplyScalar(avgUp.dot(currentDir))
-    );
+    // B) Axial roll/twist around sDir vector (wrist roll) - using grip space orientation
+    this.sQTmp.setFromRotationMatrix(grip1.matrixWorld);
+    this.sUp1.set(0, 1, 0).applyQuaternion(this.sQTmp);
+    this.sQTmp.setFromRotationMatrix(grip2.matrixWorld);
+    this.sUp2.set(0, 1, 0).applyQuaternion(this.sQTmp);
+    this.sAvg.addVectors(this.sUp1, this.sUp2);
+    if (this.sAvg.lengthSq() < 1e-8) this.sAvg.set(0, 1, 0);
+    this.sAvg.normalize();
+    this.sProj.copy(this.sAvg).addScaledVector(this.sDir, -this.sAvg.dot(this.sDir));
 
-    let qTwist = this.tmpQuat2.identity();
-    if (currentProjUp.lengthSq() > 0.0001) {
-      currentProjUp.normalize();
-      const transformedInitialUp = this.twoHandState.initialControllerUp.clone().applyQuaternion(qDir);
-      const cross = this.tmpVec1.crossVectors(transformedInitialUp, currentProjUp);
-      const dot = THREE.MathUtils.clamp(transformedInitialUp.dot(currentProjUp), -1, 1);
-      const twistAngle = Math.atan2(cross.dot(currentDir), dot);
-      qTwist.setFromAxisAngle(currentDir, twistAngle);
+    this.sQTwist.identity();
+    if (this.sProj.lengthSq() > 0.0001) {
+      this.sProj.normalize();
+      this.sTransUp.copy(this.twoHandState.initialControllerUp).applyQuaternion(this.sQDir);
+      this.sCross.crossVectors(this.sTransUp, this.sProj);
+      const dot = THREE.MathUtils.clamp(this.sTransUp.dot(this.sProj), -1, 1);
+      const twistAngle = Math.atan2(this.sCross.dot(this.sDir), dot);
+      if (Number.isFinite(twistAngle)) {
+        this.sQTwist.setFromAxisAngle(this.sDir, twistAngle);
+      }
     }
 
     // Combine direction vector rotation with axial twist
-    const totalRot = this.tmpQuat1.multiplyQuaternions(qTwist, qDir);
+    this.sQTotal.multiplyQuaternions(this.sQTwist, this.sQDir);
 
     // Compute target rotation
-    this.targetQuat.copy(totalRot).multiply(this.twoHandState.initialModelQuat);
+    this.targetQuat.copy(this.sQTotal).multiply(this.twoHandState.initialModelQuat);
+    if (!Number.isFinite(this.targetQuat.x + this.targetQuat.y + this.targetQuat.z + this.targetQuat.w)) return;
+    this.targetQuat.normalize();
 
     // 5. Centroid translation: scales and rotates offset relative to hands midpoint
-    const initialOffset = this.tmpVec1.subVectors(
+    this.sOff.subVectors(
       this.twoHandState.initialModelPos,
       this.twoHandState.initialMidpoint
     );
-    const scaledOffset = this.tmpVec2.copy(initialOffset).multiplyScalar(scaleRatio).applyQuaternion(totalRot);
-    this.targetPos.copy(currentMidpoint).add(scaledOffset);
+    this.sOff2.copy(this.sOff).multiplyScalar(scaleRatio).applyQuaternion(this.sQTotal);
+    this.targetPos.copy(this.sMid).add(this.sOff2);
+
+    // Safety: never let the target fly away (would look like "disappears")
+    if (!Number.isFinite(this.targetPos.x + this.targetPos.y + this.targetPos.z)) return;
+    if (this.targetPos.length() > 20) return;
 
     this.hasTarget = true;
   }
