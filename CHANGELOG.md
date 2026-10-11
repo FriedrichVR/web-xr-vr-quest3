@@ -14,6 +14,17 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.7.0] - 2026-10-11
+#### 🎮 Manipulación 2-Mandos sin VR + Salida de VR con B (1.2s)
+- **Rotar + escalar el modelo sin VR (Gamepad API, Quest 2D browser):**
+  - Con trigger/grip en **ambos** mandos: stick derecho X = yaw, stick derecho Y = escala (existente), stick izquierdo Y = pitch, stick izquierdo X = roll.
+  - Velocidades angulares con ease exponencial (`k=12`, 1.6 rad/s) y zona muerta 0.18: sin escalones. Clamp relativo 0.05x–8.0x heredado.
+  - Orden de pads = enumeración del browser (pad[0] yaw+escala, pad[1] pitch+roll); verificar con `?debugpads=1` si se sienten invertidos.
+- **B/Y dual: tap = reset, mantener 1.2s = salir de VR a la página 2D:**
+  - La acción de tap se difiere al release: un hold nunca resetea antes de salir. Pulso a los 600ms ("seguí manteniendo") + buzz largo al salir.
+  - `exitSession()` + `sessionend` robusto: limpia grabs fantasma, two-hand, recall, escala desktop y estados de botones (salir a mitad de un grab ya no deja estado corrupto).
+- Guía del HUD actualizada. Un cursor (pan/órbita) y VR inmersivo sin cambios.
+
 ### [v1.6.0] - 2026-10-11
 #### ✨ Paquete UX en VR: Highlight + Hápticos + Bring-To-Me + Reset en Mando
 - **Highlight al apuntar:** el modelo brilla (pulso emisivo sky-blue) cuando un ray lo toca y glow fijo mientras se agarra; restaura el emisivo original al soltar. Materiales cacheados por carga (incluye multi-material, ignora básicos sin emissive).

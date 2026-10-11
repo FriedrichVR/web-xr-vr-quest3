@@ -251,6 +251,12 @@ class WebXRGLBViewer {
   // Environment & Passthrough (MR / VR) State
   private isPassthrough: boolean = false;
   private prevButtonAState: boolean = false;
+  // B/Y dual-role: tap = reset pose, hold 1.2s = exit VR to the 2D page
+  private readonly B_EXIT_HOLD_MS = 1200;
+  private bPressStart: number = 0;
+  private bExitFired: boolean = false;
+  private bHalfTick: boolean = false;
+  private bPad: Gamepad | null = null;
   private vrSkyDome!: THREE.Mesh;
   private grid!: THREE.GridHelper;
   private pedestal!: THREE.Mesh;
@@ -337,7 +343,10 @@ class WebXRGLBViewer {
   // no 6DoF poses outside XR, so delta comes from thumbsticks while both
   // trigger/grip are held). Silently inactive when no pads are exposed.
   private desktopScale: { ratio: number } | null = null;
+  private desktopAngVel = new THREE.Vector3(); // smoothed pitch/yaw/roll rad/s
   private readonly DESKTOP_SCALE_RATE = 0.9; // ratio units/sec at full stick deflection
+  private readonly DESKTOP_ANG_RATE = 1.6; // rad/sec at full stick deflection
+  private readonly DESKTOP_ANG_K = 12; // angular velocity easing (no steps)
   private readonly DESKTOP_STICK_DEADZONE = 0.18;
   private debugPads: boolean = false;
 
@@ -1358,19 +1367,57 @@ class WebXRGLBViewer {
           this.prevButtonAState = isPressed;
         }
       }
-      // Secondary face button (B on right / Y on left, buttons[5]): pose reset
+      // Secondary face button (B on right / Y on left, buttons[5]):
+      // TAP = reset pose, HOLD 1.2s = exit VR to the 2D page. The tap action
+      // is deferred until release so a long-press never resets first.
       const btnB = gamepad.buttons[5];
       if (btnB && (btnB.pressed || btnB.value > 0.5)) {
         bPressed = true;
+        const now = performance.now();
         if (!this.prevButtonBState) {
-          this.resetModelPose();
-          if (gamepad.hapticActuators && gamepad.hapticActuators[0]) {
-            gamepad.hapticActuators[0].pulse(0.6, 40);
+          this.bPressStart = now;
+          this.bExitFired = false;
+          this.bHalfTick = false;
+          this.bPad = gamepad;
+        } else {
+          const heldFor = now - this.bPressStart;
+          if (!this.bHalfTick && heldFor >= 600) {
+            this.bHalfTick = true;
+            gamepad.hapticActuators?.[0]?.pulse(0.4, 30);
+            this.updateStatus(true, 'Hold B • Release=Reset, Keep Holding=Exit VR');
+          }
+          if (!this.bExitFired && heldFor >= this.B_EXIT_HOLD_MS) {
+            this.bExitFired = true;
+            gamepad.hapticActuators?.[0]?.pulse(1.0, 120);
+            this.exitSession();
           }
         }
       }
     }
+    // Falling edge: tap (released before the exit threshold, exit not fired)
+    if (this.prevButtonBState && !bPressed) {
+      if (!this.bExitFired && this.bPressStart > 0 &&
+          performance.now() - this.bPressStart < this.B_EXIT_HOLD_MS) {
+        this.resetModelPose();
+        this.bPad?.hapticActuators?.[0]?.pulse(0.6, 40);
+      }
+      this.bPressStart = 0;
+      this.bPad = null;
+    }
     this.prevButtonBState = bPressed;
+  }
+
+  /** Ends the immersive session, returning to the non-VR 2D page. */
+  private exitSession(): void {
+    try {
+      const session = this.renderer.xr.getSession();
+      if (session) {
+        this.updateStatus(true, 'Exiting VR • Back to 2D Page...');
+        session.end().catch(() => undefined);
+      }
+    } catch {
+      // already ended: sessionend listener restores desktop state
+    }
   }
 
   /** Restores position + rotation + normalized scale (HUD Reset + B/Y share it). */
@@ -1510,14 +1557,17 @@ class WebXRGLBViewer {
   }
 
   /**
-   * Non-VR two-controller scale (Quest 2D browser): trigger or grip held on
-   * BOTH controllers enters scale mode; averaged thumbstick Y drives the
-   * ratio (sticks up = grow). No 6DoF poses exist outside XR, so sticks stand
-   * in for hand distance. Silently inactive without exposed gamepads.
+   * Non-VR two-controller manipulation (Quest 2D browser): trigger or grip
+   * held on BOTH controllers enters the mode; sticks drive SCALE + ROTATION
+   * of the model, mirroring VR two-hand gestures. No 6DoF poses exist outside
+   * XR, so sticks stand in for hand motion. Silently inactive without exposed
+   * gamepads. Pad order = browser enumeration (pad[0] yaw+scale, pad[1]
+   * pitch+roll); confirm with ?debugpads=1 if axes feel swapped.
    */
-  private updateDesktopScale(dt: number): void {
+  private updateDesktopGamepads(dt: number): void {
     if (this.renderer.xr.isPresenting) {
       this.desktopScale = null;
+      this.desktopAngVel.set(0, 0, 0);
       return;
     }
     const pads: Gamepad[] = [];
@@ -1527,6 +1577,7 @@ class WebXRGLBViewer {
       }
     } catch {
       this.desktopScale = null;
+      this.desktopAngVel.set(0, 0, 0);
       return;
     }
 
@@ -1534,23 +1585,27 @@ class WebXRGLBViewer {
     if (held.length >= 2) {
       if (!this.desktopScale) {
         this.desktopScale = { ratio: 1 };
-        this.updateStatus(true, 'Desktop Scale • Both Triggers + Sticks');
+        this.updateStatus(true, 'Desktop 2-Hand • Sticks Rotate + Scale');
       }
-      // Thumbstick Y: axes[3] (right stick) preferred, axes[1] fallback
-      let stickSum = 0;
+      const ax = (p: Gamepad, i: number): number => {
+        const v = p.axes[i] ?? 0;
+        return Number.isFinite(v) ? v : 0;
+      };
+      const gate = (v: number): number =>
+        Math.abs(v) < this.DESKTOP_STICK_DEADZONE ? 0 : v;
+
+      // Scale: averaged right-stick Y of both pads (up = grow)
+      let scaleY = 0;
       for (const p of held) {
-        const y = p.axes.length >= 4 ? p.axes[3] : p.axes[1] ?? 0;
-        stickSum += Number.isFinite(y) ? y : 0;
+        scaleY += p.axes.length >= 4 ? ax(p, 3) : ax(p, 1);
       }
-      const avgY = stickSum / held.length;
-      const gated =
-        Math.abs(avgY) < this.DESKTOP_STICK_DEADZONE ? 0 : avgY;
-      if (gated !== 0) {
+      const gatedScale = gate(scaleY / held.length);
+      if (gatedScale !== 0) {
         // Relative clamp (0.05x–8.0x of this model's normalized scale),
         // so it works for every GLB no matter its normalized magnitude.
         const base = this.modelRoot.scale.x / this.desktopScale.ratio;
         this.desktopScale.ratio = THREE.MathUtils.clamp(
-          this.desktopScale.ratio - gated * this.DESKTOP_SCALE_RATE * dt,
+          this.desktopScale.ratio - gatedScale * this.DESKTOP_SCALE_RATE * dt,
           0.05,
           8.0
         );
@@ -1559,9 +1614,27 @@ class WebXRGLBViewer {
           this.modelRoot.scale.set(s, s, s);
         }
       }
-    } else if (this.desktopScale) {
-      this.desktopScale = null;
-      this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+
+      // Rotation (local space): pad[0].X = yaw, pad[1].Y = pitch,
+      // pad[1].X = roll. Angular velocities eased to avoid steps.
+      const p0 = held[0];
+      const p1 = held[1];
+      const yawT = p0.axes.length >= 4 ? gate(ax(p0, 2)) : gate(ax(p0, 0));
+      const pitchT = p1.axes.length >= 4 ? gate(ax(p1, 1)) : 0;
+      const rollT = p1.axes.length >= 4 ? gate(ax(p1, 0)) : 0;
+      const aA = 1 - Math.exp(-this.DESKTOP_ANG_K * dt);
+      this.desktopAngVel.y += (yawT * this.DESKTOP_ANG_RATE - this.desktopAngVel.y) * aA;
+      this.desktopAngVel.x += (pitchT * this.DESKTOP_ANG_RATE - this.desktopAngVel.x) * aA;
+      this.desktopAngVel.z += (-rollT * this.DESKTOP_ANG_RATE - this.desktopAngVel.z) * aA;
+      this.modelRoot.rotateY(this.desktopAngVel.y * dt);
+      this.modelRoot.rotateX(this.desktopAngVel.x * dt);
+      this.modelRoot.rotateZ(this.desktopAngVel.z * dt);
+    } else {
+      if (this.desktopScale) {
+        this.desktopScale = null;
+        this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+      }
+      this.desktopAngVel.set(0, 0, 0);
     }
 
     if (this.debugPads) this.renderPadDebug(pads);
@@ -1643,10 +1716,22 @@ class WebXRGLBViewer {
     });
 
     this.renderer.xr.addEventListener('sessionend', () => {
-      this.updateStatus(true, 'Session Ended');
+      this.updateStatus(true, 'Session Ended • Back on 2D Page');
       this.controls.enabled = true;
       // Ensure world lock remains clean upon session exit
       this.scene.attach(this.modelRoot);
+      // Drop stale interaction state (e.g. exiting mid-grab via hold-B):
+      // selectend/squeezeend never fire for the dead session.
+      this.activeGrabs.clear();
+      this.twoHandState = null;
+      this.hasTarget = false;
+      this.recallAnim = null;
+      this.desktopScale = null;
+      this.desktopAngVel.set(0, 0, 0);
+      this.bPressStart = 0;
+      this.bExitFired = false;
+      this.prevButtonBState = false;
+      this.prevButtonAState = false;
     });
   }
 
@@ -1694,7 +1779,7 @@ class WebXRGLBViewer {
       }
     } else {
       this.stepRecallAnim(dt);
-      this.updateDesktopScale(dt);
+      this.updateDesktopGamepads(dt);
       if (!this.desktopDrag) this.controls.update();
     }
 
