@@ -14,6 +14,15 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.5.1] - 2026-10-11
+#### 🐛 Fix: Escala Rota según el Modelo Cargado (VR + PC)
+- **Causa:** el clamp `0.05–8.0` se aplicaba sobre la escala **absoluta**, pero cada GLB normaliza a una escala absoluta distinta (casa grande ≈ 0.02, objeto chico ≈ 10+). Al agarrar para escalar, el clamp pisaba el valor: el modelo saltaba de tamaño y el rango quedaba descentrado/roto.
+- **Solución (límites ahora relativos `0.05x–8.0x`, como documenta la tabla de controles):**
+  - VR: `target = baseDelModelo × ratio` (el ratio ya venía clampeado) + guard anti-NaN.
+  - PC/Gamepad: ratio clampeado plano `[0.05, 8.0]`, `s = base × ratio` + guard.
+- **Estado limpio por modelo:** `normalizeAndDisplayModel` guarda la referencia `normalizedScale` (1.0x propio de cada modelo) y resetea targets de grab/escala pendientes, para que cada modelo cargado desde la UI escale sano desde su referencia.
+- **Reset completo:** el botón Reset ahora restaura posición + rotación + escala normalizada.
+
 ### [v1.5.0] - 2026-10-11
 #### 🖱️ Paridad Total Quest-2D = Mouse PC + Escala 2-Mandos sin VR (VR intacto)
 - **PAN con UN solo botón de grab (botón 0 = click izq PC = trigger Quest):**

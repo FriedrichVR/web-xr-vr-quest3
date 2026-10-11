@@ -238,6 +238,7 @@ class WebXRGLBViewer {
 
   // Model & Anchoring
   private modelRoot: THREE.Group;
+  private normalizedScale: number = 1; // per-model 1.0x reference (scale limits are relative to this)
   private boundingBoxHelper: THREE.BoxHelper | null = null;
   private gltfLoader: GLTFLoader;
   private dracoLoader: DRACOLoader;
@@ -805,9 +806,15 @@ class WebXRGLBViewer {
     step = THREE.MathUtils.clamp(step, -maxStep, maxStep); // slew limit kills spikes
     st.smoothedRatio = THREE.MathUtils.clamp(st.smoothedRatio + step, 0.05, 8.0);
 
+    // Relative clamp: limits are 0.05x–8.0x OF THE MODEL'S OWN normalized
+    // scale (scaleRatio is already clamped). An absolute clamp here broke
+    // scaling for models normalizing outside [0.05, 8.0] (huge or tiny GLBs).
     const scaleRatio = st.smoothedRatio;
     const baseScale = st.initialModelScale.x;
-    const targetScaleVal = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
+    let targetScaleVal = baseScale * scaleRatio;
+    if (!Number.isFinite(targetScaleVal) || targetScaleVal <= 0) {
+      targetScaleVal = this.modelRoot.scale.x;
+    }
     this.targetScale.set(targetScaleVal, targetScaleVal, targetScaleVal);
 
     // 4. FULL 3D ROTATION (Pitch, Yaw, Roll) using filtered orientations
@@ -919,7 +926,19 @@ class WebXRGLBViewer {
     // Normalize scale to fit nicely in 0.65m cube
     const maxDim = Math.max(size.x, size.y, size.z);
     const targetScale = maxDim > 0 ? 0.65 / maxDim : 1.0;
+    this.normalizedScale = targetScale;
     this.modelRoot.scale.set(targetScale, targetScale, targetScale);
+
+    // Fresh model = fresh interaction state: drop any stale grab/scale
+    // targets so the new model scales cleanly from its own 1.0x reference.
+    this.twoHandState = null;
+    this.hasTarget = false;
+    this.desktopScale = null;
+    if (this.desktopDrag) {
+      this.desktopDrag = null;
+      this.renderer.domElement.style.cursor = '';
+    }
+    if (!this.renderer.xr.isPresenting) this.controls.enabled = true;
 
     this.modelRoot.add(object);
 
@@ -1106,6 +1125,11 @@ class WebXRGLBViewer {
       btnReset.addEventListener('click', () => {
         this.modelRoot.position.set(0, 1.3, -1.2);
         this.modelRoot.rotation.set(0, 0, 0);
+        this.modelRoot.scale.set(
+          this.normalizedScale,
+          this.normalizedScale,
+          this.normalizedScale
+        );
         this.updateStatus(true, 'Position Reset • World-Locked');
       });
     }
@@ -1336,18 +1360,18 @@ class WebXRGLBViewer {
       const gated =
         Math.abs(avgY) < this.DESKTOP_STICK_DEADZONE ? 0 : avgY;
       if (gated !== 0) {
+        // Relative clamp (0.05x–8.0x of this model's normalized scale),
+        // so it works for every GLB no matter its normalized magnitude.
         const base = this.modelRoot.scale.x / this.desktopScale.ratio;
         this.desktopScale.ratio = THREE.MathUtils.clamp(
           this.desktopScale.ratio - gated * this.DESKTOP_SCALE_RATE * dt,
-          0.05 / Math.max(base, 1e-6),
-          8.0 / Math.max(base, 1e-6)
-        );
-        const s = THREE.MathUtils.clamp(
-          base * this.desktopScale.ratio,
           0.05,
           8.0
         );
-        this.modelRoot.scale.set(s, s, s);
+        const s = base * this.desktopScale.ratio;
+        if (Number.isFinite(s) && s > 0) {
+          this.modelRoot.scale.set(s, s, s);
+        }
       }
     } else if (this.desktopScale) {
       this.desktopScale = null;
