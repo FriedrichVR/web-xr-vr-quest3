@@ -1,7 +1,218 @@
 import * as THREE from 'three';
 import { XRControllerModelFactory } from 'three/examples/jsm/webxr/XRControllerModelFactory.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+/**
+ * World-locked 3D loading overlay: progress bar + canvas status text.
+ * Shown while a GLB downloads, fades out on completion, turns red on error.
+ * Yaw-billboarded every frame so it always faces the user.
+ */
+class LoadingUI3D extends THREE.Group {
+  private bgBar: THREE.Mesh;
+  private progressBar: THREE.Mesh;
+  private panel: THREE.Mesh;
+  private textMesh: THREE.Mesh;
+  private textCanvas: HTMLCanvasElement;
+  private textCtx: CanvasRenderingContext2D;
+  private textTexture: THREE.CanvasTexture;
+  private lastText: string = '';
+  private mode: 'hidden' | 'loading' | 'done' | 'error' = 'hidden';
+  private indeterminate: boolean = false;
+  private stateTimer: number = 0;
+  private camPos = new THREE.Vector3();
+
+  private readonly BAR_W = 1.0;
+  private readonly BAR_H = 0.06;
+
+  constructor() {
+    super();
+
+    // Dim backdrop panel for readability in VR void and passthrough
+    const panelGeo = new THREE.PlaneGeometry(1.3, 0.62);
+    const panelMat = new THREE.MeshBasicMaterial({
+      color: 0x0f172a,
+      transparent: true,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    this.panel = new THREE.Mesh(panelGeo, panelMat);
+    this.panel.position.z = -0.004;
+    this.panel.renderOrder = 998;
+
+    // Bar background (track)
+    const bgGeo = new THREE.PlaneGeometry(this.BAR_W, this.BAR_H);
+    const bgMat = new THREE.MeshBasicMaterial({
+      color: 0x334155,
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    this.bgBar = new THREE.Mesh(bgGeo, bgMat);
+    this.bgBar.position.y = -0.12;
+    this.bgBar.renderOrder = 999;
+
+    // Active progress bar — geometry shifted so scale.x grows left-to-right
+    const barGeo = new THREE.PlaneGeometry(this.BAR_W, this.BAR_H);
+    barGeo.translate(this.BAR_W / 2, 0, 0);
+    const barMat = new THREE.MeshBasicMaterial({
+      color: 0x38bdf8,
+      transparent: true,
+      opacity: 0.95,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    this.progressBar = new THREE.Mesh(barGeo, barMat);
+    this.progressBar.position.set(-this.BAR_W / 2, -0.12, 0.002);
+    this.progressBar.scale.x = 0;
+    this.progressBar.renderOrder = 1000;
+
+    // Canvas-backed status text (filename + percent / state)
+    this.textCanvas = document.createElement('canvas');
+    this.textCanvas.width = 512;
+    this.textCanvas.height = 160;
+    const ctx = this.textCanvas.getContext('2d');
+    if (!ctx) throw new Error('2D canvas context unavailable for LoadingUI3D');
+    this.textCtx = ctx;
+    this.textTexture = new THREE.CanvasTexture(this.textCanvas);
+    this.textTexture.colorSpace = THREE.SRGBColorSpace;
+    const textGeo = new THREE.PlaneGeometry(1.1, 0.34);
+    const textMat = new THREE.MeshBasicMaterial({
+      map: this.textTexture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthTest: false,
+    });
+    this.textMesh = new THREE.Mesh(textGeo, textMat);
+    this.textMesh.position.y = 0.1;
+    this.textMesh.renderOrder = 1001;
+
+    this.add(this.panel, this.bgBar, this.progressBar, this.textMesh);
+    this.visible = false;
+  }
+
+  /** Place in front of the camera at eye level and start showing progress. */
+  public show(label: string, camera: THREE.Camera): void {
+    camera.getWorldPosition(this.camPos);
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1);
+    dir.normalize();
+    this.position.copy(this.camPos).addScaledVector(dir, 1.5);
+    this.position.y = this.camPos.y;
+
+    this.mode = 'loading';
+    this.indeterminate = false;
+    this.stateTimer = 0;
+    this.progressBar.scale.x = 0;
+    (this.progressBar.material as THREE.MeshBasicMaterial).color.set(0x38bdf8);
+    this.setGroupOpacity(1);
+    this.drawText(label, '0%');
+    this.visible = true;
+  }
+
+  /** percent 0-100, or null when total size is unknown (indeterminate pulse). */
+  public updateProgress(label: string, percent: number | null): void {
+    if (this.mode !== 'loading') return;
+    if (percent === null) {
+      this.indeterminate = true;
+      this.drawText(label, '···');
+      return;
+    }
+    this.indeterminate = false;
+    const p = THREE.MathUtils.clamp(Math.round(percent), 0, 100);
+    this.progressBar.scale.x = p / 100;
+    this.drawText(label, `${p}%`);
+  }
+
+  public complete(label: string): void {
+    if (this.mode !== 'loading') return;
+    this.mode = 'done';
+    this.stateTimer = 0;
+    this.indeterminate = false;
+    this.progressBar.scale.x = 1;
+    this.drawText(label, '100%');
+  }
+
+  public fail(label: string, message: string): void {
+    this.mode = 'error';
+    this.stateTimer = 0;
+    this.indeterminate = false;
+    (this.progressBar.material as THREE.MeshBasicMaterial).color.set(0xef4444);
+    this.progressBar.scale.x = 1;
+    this.setGroupOpacity(1);
+    this.drawText(`${label} — FAILED`, message, '#f87171');
+    this.visible = true;
+  }
+
+  /** Per-frame: yaw billboard + indeterminate pulse + auto fade-out. */
+  public tick(timestamp: number, camera: THREE.Camera, dt: number): void {
+    if (!this.visible) return;
+
+    // Yaw-only billboard (keeps text upright)
+    camera.getWorldPosition(this.camPos);
+    const yaw = Math.atan2(this.camPos.x - this.position.x, this.camPos.z - this.position.z);
+    this.rotation.set(0, yaw, 0);
+
+    if (this.mode === 'loading' && this.indeterminate) {
+      const t = (timestamp / 1000) % 1.4 / 1.4;
+      this.progressBar.scale.x = 0.25 + 0.2 * Math.sin(t * Math.PI * 2);
+      this.progressBar.position.x = -this.BAR_W / 2 + t * this.BAR_W * 0.55;
+    } else if (this.mode === 'loading') {
+      this.progressBar.position.x = -this.BAR_W / 2;
+    }
+
+    if (this.mode === 'done') {
+      this.stateTimer += dt;
+      if (this.stateTimer > 0.45) {
+        const fade = 1 - Math.min((this.stateTimer - 0.45) / 0.4, 1);
+        this.setGroupOpacity(fade);
+        if (fade <= 0) {
+          this.visible = false;
+          this.mode = 'hidden';
+        }
+      }
+    } else if (this.mode === 'error') {
+      this.stateTimer += dt;
+      if (this.stateTimer > 5) {
+        this.visible = false;
+        this.mode = 'hidden';
+      }
+    }
+  }
+
+  private setGroupOpacity(o: number): void {
+    (this.panel.material as THREE.MeshBasicMaterial).opacity = 0.72 * o;
+    (this.bgBar.material as THREE.MeshBasicMaterial).opacity = 0.9 * o;
+    (this.progressBar.material as THREE.MeshBasicMaterial).opacity = 0.95 * o;
+    (this.textMesh.material as THREE.MeshBasicMaterial).opacity = o;
+  }
+
+  private drawText(label: string, mainLine: string, color = '#f8fafc'): void {
+    const short = label.length > 34 ? `…${label.slice(-33)}` : label;
+    const key = `${short}|${mainLine}|${color}`;
+    if (key === this.lastText) return;
+    this.lastText = key;
+
+    const c = this.textCtx;
+    c.clearRect(0, 0, 512, 160);
+    c.textAlign = 'center';
+    c.fillStyle = '#94a3b8';
+    c.font = '600 30px "Space Grotesk", sans-serif';
+    c.fillText('LOADING 3D MODEL', 256, 44);
+    c.fillStyle = color;
+    c.font = '500 34px "JetBrains Mono", monospace';
+    c.fillText(short, 256, 88);
+    c.fillStyle = mainLine === '···' ? '#38bdf8' : color;
+    c.font = '700 44px "JetBrains Mono", monospace';
+    c.fillText(mainLine, 256, 140);
+    this.textTexture.needsUpdate = true;
+  }
+}
 
 /**
  * Spatial Viewer Architecture
@@ -29,6 +240,9 @@ class WebXRGLBViewer {
   private modelRoot: THREE.Group;
   private boundingBoxHelper: THREE.BoxHelper | null = null;
   private gltfLoader: GLTFLoader;
+  private dracoLoader: DRACOLoader;
+  private loadingUI: LoadingUI3D;
+  private loadToken: number = 0;
 
   // Environment & Passthrough (MR / VR) State
   private isPassthrough: boolean = false;
@@ -170,8 +384,15 @@ class WebXRGLBViewer {
     this.modelRoot.position.set(0, 1.3, -1.2);
     this.scene.add(this.modelRoot);
 
-    // 6. Loader setup
+    // 6. Loader setup with Draco mesh-compression support
+    this.dracoLoader = new DRACOLoader();
+    this.dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/gltf/');
     this.gltfLoader = new GLTFLoader();
+    this.gltfLoader.setDRACOLoader(this.dracoLoader);
+
+    // 6b. In-scene 3D loading overlay (world-locked progress bar + status)
+    this.loadingUI = new LoadingUI3D();
+    this.scene.add(this.loadingUI);
 
     // Initialize environment & WebXR controllers
     this.setupLightingAndEnvironment();
@@ -703,19 +924,57 @@ class WebXRGLBViewer {
   }
 
   /**
-   * Loads a GLB model from a URL or fallback procedural artifact
+   * Central GLTF fetch: drives the 3D loading overlay via onProgress,
+   * guards stale callbacks with a load token, then routes to handlers.
    */
-  public loadModelFromUrl(url: string): void {
-    this.updateStatus(false, 'Loading 3D Model...');
+  private startGltfLoad(
+    url: string,
+    label: string,
+    onSuccess: (gltf: { scene: THREE.Object3D }) => void,
+    onError: (err: unknown) => void
+  ): void {
+    const token = ++this.loadToken;
+    this.loadingUI.show(label, this.camera);
+    this.updateStatus(false, `Loading ${label}...`);
 
     this.gltfLoader.load(
       url,
       (gltf) => {
+        if (token !== this.loadToken) return; // superseded by a newer request
+        this.loadingUI.complete(label);
+        onSuccess(gltf);
+      },
+      (xhr) => {
+        if (token !== this.loadToken) return;
+        const percent =
+          xhr.total > 0 ? Math.round((xhr.loaded / xhr.total) * 100) : null;
+        this.loadingUI.updateProgress(label, percent);
+        this.updateStatus(
+          false,
+          percent === null ? `Loading ${label}...` : `Loading ${label}... ${percent}%`
+        );
+      },
+      (err) => {
+        if (token !== this.loadToken) return;
+        onError(err);
+      }
+    );
+  }
+
+  /**
+   * Loads a GLB model from a URL or fallback procedural artifact
+   */
+  public loadModelFromUrl(url: string): void {
+    const label = url.split('/').pop()?.split('?')[0] || '3D Model';
+    this.startGltfLoad(
+      url,
+      label,
+      (gltf) => {
         this.normalizeAndDisplayModel(gltf.scene);
       },
-      undefined,
       (err) => {
         console.warn(`Could not load GLB from ${url}:`, err);
+        this.loadingUI.fail(label, 'network / parse error');
         // Fallback: Generate an attractive procedural 3D sci-fi inspection artifact
         const artifact = this.createProceduralArtifact();
         this.normalizeAndDisplayModel(artifact);
@@ -802,8 +1061,7 @@ class WebXRGLBViewer {
         if (files && files.length > 0) {
           const file = files[0];
           const url = URL.createObjectURL(file);
-          this.updateStatus(false, `Loading ${file.name}...`);
-          
+
           if (modelSelect) {
             const opt = document.createElement('option');
             opt.value = url;
@@ -812,14 +1070,15 @@ class WebXRGLBViewer {
             modelSelect.appendChild(opt);
           }
 
-          this.gltfLoader.load(
+          this.startGltfLoad(
             url,
+            file.name,
             (gltf) => {
               this.normalizeAndDisplayModel(gltf.scene);
             },
-            undefined,
             (err) => {
               console.error('Failed to load custom GLB:', err);
+              this.loadingUI.fail(file.name, 'invalid .glb / .gltf');
               this.updateStatus(false, 'Failed to load GLB file');
             }
           );
@@ -1075,6 +1334,9 @@ class WebXRGLBViewer {
     if (this.boundingBoxHelper && this.boundingBoxHelper.visible) {
       this.boundingBoxHelper.update();
     }
+
+    // In-scene loading overlay: billboard, indeterminate pulse, auto fade
+    this.loadingUI.tick(timestamp, this.camera, dt);
 
     this.renderer.render(this.scene, this.camera);
   }

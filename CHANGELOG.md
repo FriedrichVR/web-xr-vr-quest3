@@ -14,6 +14,19 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.4.0] - 2026-10-11
+#### 🗜️ Soporte Draco + 📊 Loading UI 3D en Escena
+- **Descompresión Draco (`DRACOLoader` 1.5.6):**
+  - Decoder WASM desde CDN oficial Google (`gstatic.com/draco/versioned/decoders/1.5.6/gltf/`).
+  - Acoplado al `GLTFLoader` vía `setDRACOLoader`: los `.glb`/`.gltf` comprimidos con Draco ahora cargan directo (modelos más livianos = descarga más rápida en el Quest).
+- **Overlay de carga 3D world-locked (`LoadingUI3D`):**
+  - Panel + barra de progreso (crece izq→der, sin z-fighting) + texto en canvas (nombre archivo + %).
+  - Se posiciona frente a la cámara a 1.5m a altura de ojos y hace **yaw-billboard** cada frame (siempre legible, texto vertical).
+  - `onProgress` real (`loaded/total`); si el total es desconocido muestra **pulso indeterminado** animado.
+  - Ciclo de vida: aparece al iniciar, marca 100% y hace **fade-out** al completar; en error la barra pasa a **rojo** con el motivo y auto-oculta a los 5s.
+  - Centralizado en `startGltfLoad()` con **token anti-carrera**: si el usuario cambia de modelo mid-download, los callbacks viejos se ignoran.
+  - Vale para dropdown, archivo custom y carga inicial. `depthTest: false` + `renderOrder` alto: visible en VR void y passthrough.
+
 ### [v1.3.0] - 2026-10-11
 #### ✨ Desktop Grab/Pan + 🧈 Escalado Continuo sin Escalones
 - **Escalado a 2 manos sin "incrementos" (causa raíz del escalonado):**
