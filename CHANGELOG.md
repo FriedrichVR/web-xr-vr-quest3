@@ -14,6 +14,16 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.5.2] - 2026-10-11
+#### ⚡ Menor Latencia en Escalado VR a 2 Manos
+- **Causa del lag:** la cascada anti-escalones sumaba ~200ms (EMA α=0.15 + distancia k=10 + ratio k=8 + lerp final k=14 + slew 3.0/s que capaba gestos rápidos).
+- **Reajuste (fluidez conservada, respuesta ~2.5× más rápida):**
+  - EMA posiciones `0.15 → 0.45` (asienta en 1-2 frames; el ruido residual lo atrapan las etapas siguientes).
+  - Distancia `k=10 → 25`, ratio `k=8 → 22`, lerp final `k=14 → 35`.
+  - Slew limit `3.0 → 8.0` ratio/s: los piches rápidos ya no se capan; los picos siguen limitados.
+  - Se mantienen freeze sub-perceptual (0.4mm) y clamp relativo 0.05x–8.0x: sin escalones.
+- Posición/rotación intactas (`k=22`).
+
 ### [v1.5.1] - 2026-10-11
 #### 🐛 Fix: Escala Rota según el Modelo Cargado (VR + PC)
 - **Causa:** el clamp `0.05–8.0` se aplicaba sobre la escala **absoluta**, pero cada GLB normaliza a una escala absoluta distinta (casa grande ≈ 0.02, objeto chico ≈ 10+). Al agarrar para escalar, el clamp pisaba el valor: el modelo saltaba de tamaño y el rango quedaba descentrado/roto.

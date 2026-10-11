@@ -308,12 +308,15 @@ class WebXRGLBViewer {
   private sQTmp = new THREE.Quaternion();
 
   // Smoothing constants (Meta Quest 3 best practices)
-  private readonly SMOOTH_K_SCALE = 14;    // Final scale ease (input already smoothed upstream)
+  // Scale path tuned for LOW LATENCY: fast stages, anti-step guards kept
+  // (freeze-eps + slew limit) so responsiveness doesn't bring back steps.
+  private readonly SMOOTH_K_SCALE = 35;    // Final scale ease (input already smoothed upstream)
   private readonly SMOOTH_K_POS_ROT = 22;  // Position/Rotation: smoother
-  private readonly SMOOTH_K_DIST = 10;     // Stage 1: smooths raw hand distance (jitter filter)
-  private readonly SMOOTH_K_RATIO = 8;     // Stage 2: smooths scale ratio (removes steps)
-  private readonly MAX_RATIO_RATE = 3.0;   // Slew limit: ratio units per second (kills spikes, keeps fast gestures)
+  private readonly SMOOTH_K_DIST = 25;     // Stage 1: smooths raw hand distance (jitter filter)
+  private readonly SMOOTH_K_RATIO = 22;    // Stage 2: smooths scale ratio (removes steps)
+  private readonly MAX_RATIO_RATE = 8.0;   // Slew limit: ratio units per second (kills spikes, frees fast pinches)
   private readonly DIST_FREEZE_EPS = 0.0004; // Sub-perceptual freeze (0.4mm): kills rest jitter invisibly
+  private readonly EMA_ALPHA = 0.45;       // Grip-position EMA: responsive, residual noise caught downstream
 
   // Desktop / Quest-browser-2D model grab/pan — SINGLE primary button only
   // (button 0: PC left-click == Quest controller trigger). Touch: single finger
@@ -698,8 +701,9 @@ class WebXRGLBViewer {
         projUp.set(0, 1, 0);
       }
 
-      // EMA alpha for 72Hz Quest 3: ~0.15 gives ~3-4 frame settling
-      const emaAlpha = 0.15;
+      // EMA alpha for 72Hz Quest 3: 0.45 settles in ~1-2 frames
+      // (residual jitter is caught by the distance/ratio stages downstream)
+      const emaAlpha = this.EMA_ALPHA;
 
       this.twoHandState = {
         initialDistance: dist,
