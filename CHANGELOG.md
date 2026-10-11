@@ -38,6 +38,18 @@
 
 ---
 
+### [v1.2.2] - 2026-10-11
+#### 🎯 Manipulación Two-Hand Optimizada (Meta Quest 3 Best Practices)
+- **Grip Space en lugar de Target-Ray Space:** Usa la pose física del mando (`getControllerGrip`) para manipulación, no el puntero láser. Más estable y preciso según guías de Meta.
+- **EMA Filtering en Origen:** Exponential Moving Average (α=0.15) aplicado a posiciones de controladores **antes** de calcular transformaciones. Filtra jitter de tracking a 72Hz nativo.
+- **Factores de Suavizado Diferenciados:**
+  - Escala: `k=38` (responsivo, sin lag al estirar/encoger)
+  - Posición/Rotación: `k=22` (suave, elimina micro-movimientos)
+- **Dead Zone en Escalado (5mm):** Ignora cambios menores al threshold, evita "flutter" al mantener manos quietas.
+- **Orientaciones desde Grip Space:** Roll/Pitch/Yaw calculados con rotación física del mando, no del rayo.
+
+---
+
 ### [v1.1.0] - 2026-10-10
 #### ✨ Nuevas Características
 - **Modo Passthrough (Realidad Mixta) con Botón A:**

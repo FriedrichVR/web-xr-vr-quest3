@@ -57,6 +57,10 @@ class WebXRGLBViewer {
     initialModelScale: THREE.Vector3;
     initialModelPos: THREE.Vector3;
     initialModelQuat: THREE.Quaternion;
+    // EMA filtered controller positions (grip space)
+    filteredP1: THREE.Vector3;
+    filteredP2: THREE.Vector3;
+    emaAlpha: number;
   } | null = null;
 
   // Smoothing state
@@ -72,6 +76,11 @@ class WebXRGLBViewer {
   private tmpVec3 = new THREE.Vector3();
   private tmpQuat1 = new THREE.Quaternion();
   private tmpQuat2 = new THREE.Quaternion();
+
+  // Smoothing constants (Meta Quest 3 best practices)
+  private readonly SMOOTH_K_SCALE = 38;    // Scale: more responsive, less smoothing
+  private readonly SMOOTH_K_POS_ROT = 22;  // Position/Rotation: smoother
+  private readonly SCALE_DEAD_ZONE = 0.005; // 5mm dead zone for scale stability
 
   // Status HUD elements
   private statusDot: HTMLElement | null;
@@ -394,22 +403,28 @@ class WebXRGLBViewer {
       this.scene.attach(this.modelRoot);
 
       const [c1, c2] = Array.from(this.activeGrabs.keys());
-      const p1 = new THREE.Vector3().setFromMatrixPosition(c1.matrixWorld);
-      const p2 = new THREE.Vector3().setFromMatrixPosition(c2.matrixWorld);
+      const idx1 = c1.userData.index as number;
+      const idx2 = c2.userData.index as number;
 
-      const midpoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
-      const dir = new THREE.Vector3().subVectors(p2, p1).normalize();
+      // Use GRIP SPACE (physical controller pose) for manipulation - Meta best practice
+      const grip1 = this.controllerGrips[idx1];
+      const grip2 = this.controllerGrips[idx2];
+      const p1 = this.tmpVec1.setFromMatrixPosition(grip1.matrixWorld);
+      const p2 = this.tmpVec2.setFromMatrixPosition(grip2.matrixWorld);
 
-      // Average up orientation of both controllers in world space
-      const up1 = new THREE.Vector3(0, 1, 0).applyQuaternion(
-        new THREE.Quaternion().setFromRotationMatrix(c1.matrixWorld)
+      const midpoint = this.tmpVec3.addVectors(p1, p2).multiplyScalar(0.5);
+      const dir = this.tmpVec1.subVectors(p2, p1).normalize();
+
+      // Average up orientation of both controllers in world space (from grip space)
+      const up1 = this.tmpVec1.set(0, 1, 0).applyQuaternion(
+        this.tmpQuat1.setFromRotationMatrix(grip1.matrixWorld)
       );
-      const up2 = new THREE.Vector3(0, 1, 0).applyQuaternion(
-        new THREE.Quaternion().setFromRotationMatrix(c2.matrixWorld)
+      const up2 = this.tmpVec2.set(0, 1, 0).applyQuaternion(
+        this.tmpQuat1.setFromRotationMatrix(grip2.matrixWorld)
       );
-      const avgUp = new THREE.Vector3().addVectors(up1, up2).normalize();
-      const projUp = new THREE.Vector3().copy(avgUp).sub(
-        dir.clone().multiplyScalar(avgUp.dot(dir))
+      const avgUp = this.tmpVec1.addVectors(up1, up2).normalize();
+      const projUp = this.tmpVec2.copy(avgUp).sub(
+        this.tmpVec3.copy(dir).multiplyScalar(avgUp.dot(dir))
       );
       if (projUp.lengthSq() > 0.0001) {
         projUp.normalize();
@@ -417,14 +432,21 @@ class WebXRGLBViewer {
         projUp.set(0, 1, 0);
       }
 
+      // EMA alpha for 72Hz Quest 3: ~0.15 gives ~3-4 frame settling
+      const emaAlpha = 0.15;
+
       this.twoHandState = {
         initialDistance: Math.max(p1.distanceTo(p2), 0.05),
-        initialMidpoint: midpoint,
-        initialDir: dir,
-        initialControllerUp: projUp,
+        initialMidpoint: midpoint.clone(),
+        initialDir: dir.clone(),
+        initialControllerUp: projUp.clone(),
         initialModelScale: this.modelRoot.scale.clone(),
         initialModelPos: this.modelRoot.position.clone(),
         initialModelQuat: this.modelRoot.quaternion.clone(),
+        // Initialize EMA with current grip positions
+        filteredP1: p1.clone(),
+        filteredP2: p2.clone(),
+        emaAlpha,
       };
 
       this.updateStatus(true, 'Two-Hand 3D Rotating & Scaling');
@@ -456,41 +478,62 @@ class WebXRGLBViewer {
 
   /**
    * Per-frame manipulation logic during two-hand gestures:
-   * Computes target transform for smoothing
+   * Uses GRIP SPACE with EMA filtering for stable tracking (Meta best practice)
    */
   private updateTwoHandTransform(): void {
     if (!this.twoHandState || this.activeGrabs.size < 2) return;
 
     const [c1, c2] = Array.from(this.activeGrabs.keys());
+    const idx1 = c1.userData.index as number;
+    const idx2 = c2.userData.index as number;
 
-    // Reuse vectors to avoid allocations
-    const p1 = this.tmpVec1.setFromMatrixPosition(c1.matrixWorld);
-    const p2 = this.tmpVec2.setFromMatrixPosition(c2.matrixWorld);
+    // Use GRIP SPACE (physical controller pose) - more stable than target-ray
+    const grip1 = this.controllerGrips[idx1];
+    const grip2 = this.controllerGrips[idx2];
 
-    // 1. Current geometry between controllers
+    // Get raw grip positions
+    const rawP1 = this.tmpVec1.setFromMatrixPosition(grip1.matrixWorld);
+    const rawP2 = this.tmpVec2.setFromMatrixPosition(grip2.matrixWorld);
+
+    // 1. EMA filtering on controller positions (filters tracking jitter at source)
+    const alpha = this.twoHandState.emaAlpha;
+    this.twoHandState.filteredP1.lerp(rawP1, alpha);
+    this.twoHandState.filteredP2.lerp(rawP2, alpha);
+
+    const p1 = this.twoHandState.filteredP1;
+    const p2 = this.twoHandState.filteredP2;
+
+    // 2. Current geometry between FILTERED controller positions
     const currentDistance = Math.max(p1.distanceTo(p2), 0.05);
     const currentMidpoint = this.tmpVec3.addVectors(p1, p2).multiplyScalar(0.5);
     const currentDir = this.tmpVec1.subVectors(p2, p1).normalize();
 
-    // 2. Dual-hand Pinch / Stretch Scaling (Clamped between 0.05x and 8.0x)
+    // 3. Dual-hand Pinch / Stretch Scaling with DEAD ZONE (prevents micro-jitter)
     const scaleRatio = currentDistance / this.twoHandState.initialDistance;
     const baseScale = this.twoHandState.initialModelScale.x;
-    const targetScaleVal = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
+    let targetScaleVal = baseScale * scaleRatio;
+
+    // Dead zone: only update scale if change exceeds threshold
+    const scaleDelta = Math.abs(targetScaleVal - this.modelRoot.scale.x);
+    if (scaleDelta < this.SCALE_DEAD_ZONE) {
+      targetScaleVal = this.modelRoot.scale.x; // Hold current scale
+    }
+    targetScaleVal = THREE.MathUtils.clamp(targetScaleVal, 0.05, 8.0);
     this.targetScale.set(targetScaleVal, targetScaleVal, targetScaleVal);
 
-    // 3. FULL 3D ROTATION (Across all 3 axes: Pitch, Yaw, Roll)
-    // A) 3D Direction vector rotation (rotates initialDir to currentDir in 3D space)
+    // 4. FULL 3D ROTATION (Pitch, Yaw, Roll) using filtered orientations
+    // A) 3D Direction vector rotation
     const qDir = this.tmpQuat1.setFromUnitVectors(
       this.twoHandState.initialDir,
       currentDir
     );
 
-    // B) Axial roll/twist around the currentDir vector (wrist roll)
+    // B) Axial roll/twist around currentDir vector (wrist roll) - using grip space orientation
     const up1 = this.tmpVec1.set(0, 1, 0).applyQuaternion(
-      this.tmpQuat2.setFromRotationMatrix(c1.matrixWorld)
+      this.tmpQuat2.setFromRotationMatrix(grip1.matrixWorld)
     );
     const up2 = this.tmpVec2.set(0, 1, 0).applyQuaternion(
-      this.tmpQuat2.setFromRotationMatrix(c2.matrixWorld)
+      this.tmpQuat2.setFromRotationMatrix(grip2.matrixWorld)
     );
     const avgUp = this.tmpVec1.addVectors(up1, up2).normalize();
     const currentProjUp = this.tmpVec2.copy(avgUp).sub(
@@ -513,7 +556,7 @@ class WebXRGLBViewer {
     // Compute target rotation
     this.targetQuat.copy(totalRot).multiply(this.twoHandState.initialModelQuat);
 
-    // 4. Centroid translation: scales and rotates offset relative to hands midpoint
+    // 5. Centroid translation: scales and rotates offset relative to hands midpoint
     const initialOffset = this.tmpVec1.subVectors(
       this.twoHandState.initialModelPos,
       this.twoHandState.initialMidpoint
@@ -886,15 +929,14 @@ class WebXRGLBViewer {
       this.updateControllerRays();
 
       // Apply exponential smoothing for fluid two-hand manipulation
+      // Separate factors: scale more responsive, position/rotation smoother (Meta UX guidelines)
       if (this.hasTarget && this.activeGrabs.size === 2) {
-        // Smoothing factor (higher = snappier, lower = smoother)
-        // 1 - exp(-k * dt) gives frame-rate independent lerp factor
-        const k = 25; // Adjust: 15-20 for more smoothing, 30-40 for more responsive
-        const alpha = 1 - Math.exp(-k * dt);
+        const alphaScale = 1 - Math.exp(-this.SMOOTH_K_SCALE * dt);
+        const alphaPosRot = 1 - Math.exp(-this.SMOOTH_K_POS_ROT * dt);
 
-        this.modelRoot.position.lerp(this.targetPos, alpha);
-        this.modelRoot.quaternion.slerp(this.targetQuat, alpha);
-        this.modelRoot.scale.lerp(this.targetScale, alpha);
+        this.modelRoot.position.lerp(this.targetPos, alphaPosRot);
+        this.modelRoot.quaternion.slerp(this.targetQuat, alphaPosRot);
+        this.modelRoot.scale.lerp(this.targetScale, alphaScale);
       } else {
         this.hasTarget = false;
       }
