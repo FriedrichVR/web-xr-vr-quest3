@@ -79,10 +79,11 @@ In your terminal, Vite will display your local network URL:
 
 | Action | Quest 3 Controller Gesture | Behavior |
 | :--- | :--- | :--- |
+| **Toggle Passthrough (MR / VR)** | Press **Button A** (Right Controller) | Toggles real-world color passthrough mode (only 3D model visible) vs virtual dark VR room. |
 | **Grab / Move** | Hold **Grip** or **Trigger** on 1 controller | Object attaches to controller in 6DoF space. Move your hand to reposition. |
 | **Scale & Rotate** | Hold **Grip** on **Both** controllers simultaneously | Moving controllers apart scales up; moving closer scales down. Rotating hands turns object around Y-axis. |
 | **Lock into World**| **Release all** triggers / grips | Re-attaches to world coordinates. Walk around it freely in 6DoF roomscale. |
-| **Desktop Mode**   | Mouse Drag / Scroll | OrbitControls for desktop preview before entering VR. |
+| **Desktop Mode**   | Mouse Drag / Scroll / Key **A** | OrbitControls preview and keyboard key `A` for passthrough toggle on desktop. |
 
 ---
 
@@ -98,4 +99,3 @@ npm run build
 2. Import the repository into **Vercel**.
 3. Vercel will automatically detect `vite` and execute `npm run build` with output directory `dist`.
 4. Open the generated Vercel HTTPS URL on your Quest 3 browser and enter VR immediately!
-# web-xr-vr-quest3

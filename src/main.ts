@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { VRButton } from 'three/examples/jsm/webxr/VRButton.js';
 import { XRControllerModelFactory } from 'three/examples/jsm/webxr/XRControllerModelFactory.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -30,6 +29,14 @@ class WebXRGLBViewer {
   private modelRoot: THREE.Group;
   private boundingBoxHelper: THREE.BoxHelper | null = null;
   private gltfLoader: GLTFLoader;
+
+  // Environment & Passthrough (MR / VR) State
+  private isPassthrough: boolean = false;
+  private prevButtonAState: boolean = false;
+  private grid!: THREE.GridHelper;
+  private pedestal!: THREE.Mesh;
+  private vrBackgroundColor = new THREE.Color(0x090d16);
+  private vrFog = new THREE.FogExp2(0x090d16, 0.08);
 
   // Manipulation State
   private activeGrabs: Map<THREE.XRTargetRaySpace, {
@@ -65,8 +72,8 @@ class WebXRGLBViewer {
 
     // 1. Scene setup
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x090d16);
-    this.scene.fog = new THREE.FogExp2(0x090d16, 0.08);
+    this.scene.background = this.vrBackgroundColor;
+    this.scene.fog = this.vrFog;
 
     // 2. Camera setup
     this.camera = new THREE.PerspectiveCamera(
@@ -77,8 +84,12 @@ class WebXRGLBViewer {
     );
     this.camera.position.set(0, 1.4, 1.6);
 
-    // 3. WebGLRenderer & WebXR Configuration
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    // 3. WebGLRenderer & WebXR Configuration (alpha: true required for Quest 3 camera passthrough)
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      powerPreference: 'high-performance',
+    });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -91,9 +102,8 @@ class WebXRGLBViewer {
     this.renderer.xr.setReferenceSpaceType('local-floor');
     this.container.appendChild(this.renderer.domElement);
 
-    // Setup VR Button
-    const vrButton = VRButton.createButton(this.renderer);
-    document.body.appendChild(vrButton);
+    // Setup WebXR Session Button (supports immersive-ar on Quest 3 for native passthrough)
+    this.setupWebXRButton();
 
     // 4. Desktop OrbitControls (disabled automatically during XR sessions)
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -126,6 +136,73 @@ class WebXRGLBViewer {
   }
 
   /**
+   * Sets up session request supporting immersive-ar (Quest 3 color passthrough) with fallback to immersive-vr
+   */
+  private async setupWebXRButton(): Promise<void> {
+    if ('xr' in navigator && navigator.xr) {
+      const xr = navigator.xr;
+      const isARSupported = await xr.isSessionSupported('immersive-ar').catch(() => false);
+      const isVRSupported = await xr.isSessionSupported('immersive-vr').catch(() => false);
+
+      if (!isARSupported && !isVRSupported) {
+        this.showXRNotSupported();
+        return;
+      }
+
+      const btn = document.createElement('button');
+      btn.id = 'VRButton';
+      btn.textContent = isARSupported ? 'ENTER VR / PASSTHROUGH' : 'ENTER VR';
+
+      let currentSession: XRSession | null = null;
+
+      const onSessionEnded = () => {
+        currentSession = null;
+        btn.textContent = isARSupported ? 'ENTER VR / PASSTHROUGH' : 'ENTER VR';
+        this.updateStatus(true, 'VR Session Ended');
+      };
+
+      const onSessionStarted = async (session: XRSession) => {
+        session.addEventListener('end', onSessionEnded);
+        await this.renderer.xr.setSession(session);
+        btn.textContent = 'EXIT VR';
+        currentSession = session;
+      };
+
+      btn.onclick = () => {
+        if (currentSession === null) {
+          const sessionMode: XRSessionMode = isARSupported ? 'immersive-ar' : 'immersive-vr';
+          const sessionInit: XRSessionInit = {
+            optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'layers'],
+          };
+          xr.requestSession(sessionMode, sessionInit).then(onSessionStarted).catch((err) => {
+            console.error('Failed to start WebXR session:', err);
+            // Fallback to immersive-vr if immersive-ar failed
+            if (sessionMode === 'immersive-ar') {
+              xr.requestSession('immersive-vr', sessionInit).then(onSessionStarted);
+            }
+          });
+        } else {
+          currentSession.end();
+        }
+      };
+
+      document.body.appendChild(btn);
+    } else {
+      this.showXRNotSupported();
+    }
+  }
+
+  private showXRNotSupported(): void {
+    const btn = document.createElement('button');
+    btn.id = 'VRButton';
+    btn.textContent = 'WEBXR NOT SUPPORTED';
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'not-allowed';
+    document.body.appendChild(btn);
+  }
+
+  /**
    * Sets up room lighting, soft shadow casting, and a subtle reference floor grid
    */
   private setupLightingAndEnvironment(): void {
@@ -152,9 +229,9 @@ class WebXRGLBViewer {
     this.scene.add(fillLight);
 
     // Spatial floor reference
-    const grid = new THREE.GridHelper(10, 20, 0x38bdf8, 0x1e293b);
-    grid.position.y = 0.001;
-    this.scene.add(grid);
+    this.grid = new THREE.GridHelper(10, 20, 0x38bdf8, 0x1e293b);
+    this.grid.position.y = 0.001;
+    this.scene.add(this.grid);
 
     // Circular ground pedestal
     const pedestalGeo = new THREE.CircleGeometry(1.6, 48);
@@ -163,10 +240,10 @@ class WebXRGLBViewer {
       roughness: 0.8,
       metalness: 0.1,
     });
-    const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
-    pedestal.rotation.x = -Math.PI / 2;
-    pedestal.receiveShadow = true;
-    this.scene.add(pedestal);
+    this.pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+    this.pedestal.rotation.x = -Math.PI / 2;
+    this.pedestal.receiveShadow = true;
+    this.scene.add(this.pedestal);
   }
 
   /**
@@ -584,17 +661,116 @@ class WebXRGLBViewer {
     }
   }
 
+  /**
+   * Toggles between Virtual VR Void and Real-World Passthrough mode
+   * In Passthrough mode, only the 3D model and world are visible
+   */
+  public togglePassthrough(): void {
+    this.isPassthrough = !this.isPassthrough;
+
+    const btnToggle = document.getElementById('btn-toggle-passthrough');
+
+    if (this.isPassthrough) {
+      // PASSTHROUGH MODE: Hide virtual environment, grid, pedestal & fog
+      // Only the 3D model remains visible over real-world video feed
+      this.scene.background = null;
+      this.renderer.setClearColor(0x000000, 0);
+      this.scene.fog = null;
+      if (this.grid) this.grid.visible = false;
+      if (this.pedestal) this.pedestal.visible = false;
+      if (this.boundingBoxHelper) this.boundingBoxHelper.visible = false;
+
+      if (btnToggle) {
+        btnToggle.innerHTML = `
+          <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+          </svg>
+          Passthrough Mode: ON (Btn A)`;
+        btnToggle.style.background = 'rgba(34, 197, 94, 0.2)';
+        btnToggle.style.borderColor = 'rgba(34, 197, 94, 0.6)';
+        btnToggle.style.color = '#4ade80';
+      }
+      this.updateStatus(true, 'Passthrough Mode (Real World View)');
+    } else {
+      // VR MODE: Restore virtual room void, pedestal, grid & atmospheric fog
+      this.scene.background = this.vrBackgroundColor;
+      this.renderer.setClearColor(0x090d16, 1);
+      this.scene.fog = this.vrFog;
+      if (this.grid) this.grid.visible = true;
+      if (this.pedestal) this.pedestal.visible = true;
+      if (this.boundingBoxHelper) this.boundingBoxHelper.visible = true;
+
+      if (btnToggle) {
+        btnToggle.innerHTML = `
+          <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+          </svg>
+          Passthrough Mode: OFF (Btn A)`;
+        btnToggle.style.background = 'rgba(56, 189, 248, 0.15)';
+        btnToggle.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+        btnToggle.style.color = '#38bdf8';
+      }
+      this.updateStatus(true, 'Virtual VR Mode (Void)');
+    }
+  }
+
+  /**
+   * Polls Meta Quest 3 controller buttons
+   * Detects Button A on the right controller (buttons[4] in xr-standard)
+   */
+  private checkControllerButtons(): void {
+    const session = this.renderer.xr.getSession();
+    if (!session) return;
+
+    for (const source of session.inputSources) {
+      // Quest 3 Right Controller
+      if (source.handedness === 'right' && source.gamepad) {
+        const gamepad = source.gamepad;
+        // In WebXR xr-standard mapping: buttons[4] is the primary face button (Button A)
+        const btnA = gamepad.buttons[4];
+        if (btnA) {
+          const isPressed = btnA.pressed || btnA.value > 0.5;
+          if (isPressed && !this.prevButtonAState) {
+            this.togglePassthrough();
+            // Tactile feedback on Button A press
+            if (gamepad.hapticActuators && gamepad.hapticActuators[0]) {
+              gamepad.hapticActuators[0].pulse(0.7, 50);
+            }
+          }
+          this.prevButtonAState = isPressed;
+        }
+      }
+    }
+  }
+
   private setupEventListeners(): void {
     window.addEventListener('resize', this.onWindowResize.bind(this));
 
+    // Keyboard shortcut 'A' or 'P' to toggle passthrough on desktop
+    window.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'a' || e.key === 'A' || e.key === 'p' || e.key === 'P') {
+        this.togglePassthrough();
+      }
+    });
+
+    // HUD Button toggle listener
+    const btnToggle = document.getElementById('btn-toggle-passthrough');
+    if (btnToggle) {
+      btnToggle.addEventListener('click', () => {
+        this.togglePassthrough();
+      });
+    }
+
     // Detect XR session start / end
     this.renderer.xr.addEventListener('sessionstart', () => {
-      this.updateStatus(true, 'Immersive VR Active • Quest 3');
+      this.updateStatus(true, 'Immersive Session Active • Quest 3');
       this.controls.enabled = false;
     });
 
     this.renderer.xr.addEventListener('sessionend', () => {
-      this.updateStatus(true, 'VR Session Ended');
+      this.updateStatus(true, 'Session Ended');
       this.controls.enabled = true;
       // Ensure world lock remains clean upon session exit
       this.scene.attach(this.modelRoot);
@@ -620,8 +796,9 @@ class WebXRGLBViewer {
    * Main WebXR animation and render loop
    */
   private render(): void {
-    // Process two-hand transformations if active
+    // Process XR inputs and transformations if active
     if (this.renderer.xr.isPresenting) {
+      this.checkControllerButtons();
       this.updateTwoHandTransform();
       this.updateControllerRays();
     } else {
@@ -629,7 +806,7 @@ class WebXRGLBViewer {
     }
 
     // Update bounding box helper
-    if (this.boundingBoxHelper) {
+    if (this.boundingBoxHelper && this.boundingBoxHelper.visible) {
       this.boundingBoxHelper.update();
     }
 
