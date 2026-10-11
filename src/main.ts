@@ -272,19 +272,21 @@ class WebXRGLBViewer {
     initialModelRot: THREE.Quaternion;
   }> = new Map();
 
-  // Two-hand manipulation cache (full 3-axis rotation & scale)
+  // Two-hand manipulation cache. Meta-style direct manipulation:
+  // rotation/translation are INCREMENTAL per-frame deltas (object rigidly
+  // "in the hands", no absolute drift), scale keeps its smoothed cascade.
   private twoHandState: {
     initialDistance: number;
-    initialMidpoint: THREE.Vector3;
-    initialDir: THREE.Vector3;
-    initialControllerUp: THREE.Vector3;
     initialModelScale: THREE.Vector3;
-    initialModelPos: THREE.Vector3;
-    initialModelQuat: THREE.Quaternion;
     // EMA filtered controller positions (grip space)
     filteredP1: THREE.Vector3;
     filteredP2: THREE.Vector3;
     emaAlpha: number;
+    // Previous-frame hand frame (for incremental deltas)
+    prevDir: THREE.Vector3;
+    prevMid: THREE.Vector3;
+    prevProjUp: THREE.Vector3;
+    prevTargetScale: number;
     // Cascaded scale smoothing (buttery pinch-zoom without steps)
     smoothedDistance: number;
     smoothedRatio: number;
@@ -320,7 +322,7 @@ class WebXRGLBViewer {
   // Scale path tuned for LOW LATENCY: fast stages, anti-step guards kept
   // (freeze-eps + slew limit) so responsiveness doesn't bring back steps.
   private readonly SMOOTH_K_SCALE = 35;    // Final scale ease (input already smoothed upstream)
-  private readonly SMOOTH_K_POS_ROT = 22;  // Position/Rotation: smoother
+  private readonly SMOOTH_K_POS_ROT = 30;  // Tight tracking of exact incremental targets
   private readonly SMOOTH_K_DIST = 25;     // Stage 1: smooths raw hand distance (jitter filter)
   private readonly SMOOTH_K_RATIO = 22;    // Stage 2: smooths scale ratio (removes steps)
   private readonly MAX_RATIO_RATE = 8.0;   // Slew limit: ratio units per second (kills spikes, frees fast pinches)
@@ -793,21 +795,26 @@ class WebXRGLBViewer {
 
       this.twoHandState = {
         initialDistance: dist,
-        initialMidpoint: midpoint.clone(),
-        initialDir: dir.clone(),
-        initialControllerUp: projUp.clone(),
         initialModelScale: this.modelRoot.scale.clone(),
-        initialModelPos: this.modelRoot.position.clone(),
-        initialModelQuat: this.modelRoot.quaternion.clone(),
         // Initialize EMA with current grip positions
         filteredP1: p1.clone(),
         filteredP2: p2.clone(),
         emaAlpha,
+        // Incremental frame starts exact (no first-frame snap)
+        prevDir: dir.clone(),
+        prevMid: midpoint.clone(),
+        prevProjUp: projUp.clone(),
+        prevTargetScale: this.modelRoot.scale.x,
         // Scale cascade starts settled (ratio 1:1, no jump on grab)
         smoothedDistance: dist,
         smoothedRatio: 1,
         prevRawDist: dist,
       };
+      // Accumulated targets start at the live transform
+      this.targetPos.copy(this.modelRoot.position);
+      this.targetQuat.copy(this.modelRoot.quaternion);
+      this.targetScale.copy(this.modelRoot.scale);
+      this.hasTarget = true;
       this.lastScaleRatio = 1;
       this.scaleHapticCooldown = 0;
 
@@ -841,8 +848,9 @@ class WebXRGLBViewer {
   /**
    * Per-frame manipulation logic during two-hand gestures:
    * Uses GRIP SPACE with EMA filtering for stable tracking (Meta best practice).
-   * Scale path is a 3-stage cascade (EMA positions -> smoothed distance ->
-   * slew-limited ratio) so pinch-zoom feels continuous, never stepped.
+   * Rotation/translation are INCREMENTAL deltas accumulated onto the target
+   * (direct-manipulation feel, no drift); scale keeps its 3-stage cascade
+   * (EMA positions -> smoothed distance -> slew-limited ratio), continuous.
    */
   private updateTwoHandTransform(dt: number): void {
     if (!this.twoHandState || this.activeGrabs.size < 2) return;
@@ -909,11 +917,13 @@ class WebXRGLBViewer {
     }
     this.targetScale.set(targetScaleVal, targetScaleVal, targetScaleVal);
 
-    // 4. FULL 3D ROTATION (Pitch, Yaw, Roll) using filtered orientations
-    // A) 3D Direction vector rotation
-    this.sQDir.setFromUnitVectors(this.twoHandState.initialDir, this.sDir);
+    // 4. INCREMENTAL 3D ROTATION (Pitch, Yaw, Roll) — Meta-style direct
+    // manipulation: this frame's hand delta is applied onto the accumulated
+    // target, so the object feels rigidly held (no absolute swim/drift).
+    // A) Direction-vector delta: prevDir -> current dir
+    this.sQDir.setFromUnitVectors(st.prevDir, this.sDir);
 
-    // B) Axial roll/twist around sDir vector (wrist roll) - using grip space orientation
+    // B) Axial wrist-roll delta about the current dir (grip-space up vectors)
     this.sQTmp.setFromRotationMatrix(grip1.matrixWorld);
     this.sUp1.set(0, 1, 0).applyQuaternion(this.sQTmp);
     this.sQTmp.setFromRotationMatrix(grip2.matrixWorld);
@@ -924,9 +934,10 @@ class WebXRGLBViewer {
     this.sProj.copy(this.sAvg).addScaledVector(this.sDir, -this.sAvg.dot(this.sDir));
 
     this.sQTwist.identity();
-    if (this.sProj.lengthSq() > 0.0001) {
+    if (this.sProj.lengthSq() > 0.0001 && st.prevProjUp.lengthSq() > 0.0001) {
       this.sProj.normalize();
-      this.sTransUp.copy(this.twoHandState.initialControllerUp).applyQuaternion(this.sQDir);
+      // Residual roll: prev up carried by the dir-delta vs current up
+      this.sTransUp.copy(st.prevProjUp).applyQuaternion(this.sQDir);
       this.sCross.crossVectors(this.sTransUp, this.sProj);
       const dot = THREE.MathUtils.clamp(this.sTransUp.dot(this.sProj), -1, 1);
       const twistAngle = Math.atan2(this.sCross.dot(this.sDir), dot);
@@ -935,21 +946,28 @@ class WebXRGLBViewer {
       }
     }
 
-    // Combine direction vector rotation with axial twist
+    // Combine into this frame's world-space delta and accumulate
     this.sQTotal.multiplyQuaternions(this.sQTwist, this.sQDir);
-
-    // Compute target rotation
-    this.targetQuat.copy(this.sQTotal).multiply(this.twoHandState.initialModelQuat);
+    this.targetQuat.premultiply(this.sQTotal);
     if (!Number.isFinite(this.targetQuat.x + this.targetQuat.y + this.targetQuat.z + this.targetQuat.w)) return;
     this.targetQuat.normalize();
 
-    // 5. Centroid translation: scales and rotates offset relative to hands midpoint
-    this.sOff.subVectors(
-      this.twoHandState.initialModelPos,
-      this.twoHandState.initialMidpoint
-    );
-    this.sOff2.copy(this.sOff).multiplyScalar(scaleRatio).applyQuaternion(this.sQTotal);
-    this.targetPos.copy(this.sMid).add(this.sOff2);
+    // 5. INCREMENTAL centroid translation: the model offset from the hands
+    // midpoint rides along (rotated by this frame's delta, grown by this
+    // frame's scale change), so moving hands moves the object 1:1.
+    this.sOff.copy(this.targetPos).sub(st.prevMid);
+    this.sOff.applyQuaternion(this.sQTotal);
+    if (st.prevTargetScale > 1e-9) {
+      this.sOff.multiplyScalar(targetScaleVal / st.prevTargetScale);
+    }
+    this.targetPos.copy(this.sMid).add(this.sOff);
+    st.prevTargetScale = targetScaleVal;
+
+    // Roll the hand frame forward for next frame's delta
+    st.prevDir.copy(this.sDir);
+    st.prevMid.copy(this.sMid);
+    // sProj is normalized here iff the twist branch ran; else keep last good
+    if (this.sProj.lengthSq() > 0.0001) st.prevProjUp.copy(this.sProj);
 
     // Safety: never let the target fly away (would look like "disappears")
     if (!Number.isFinite(this.targetPos.x + this.targetPos.y + this.targetPos.z)) return;
@@ -1009,23 +1027,22 @@ class WebXRGLBViewer {
   }
 
   /**
-   * Aim highlight: pulse emissive while a ray hovers the model, steady glow
-   * while grabbed, off otherwise. Restores each material's base emissive.
+   * Aim highlight: pulse emissive while a ray hovers the model, OFF while
+   * grabbed/selected (clean look during manipulation) and otherwise.
+   * Restores each material's base emissive.
    */
   private glowWasActive: boolean = false;
 
   private updateHoverHighlight(timestamp: number): void {
     if (this.highlightMats.length === 0) return;
-    const grabbed = this.activeGrabs.size > 0;
-    const active = this.aimHover || grabbed;
+    // Hover glow only: no overlay once the model is selected/grabbed
+    const active = this.aimHover && this.activeGrabs.size === 0;
     if (!active && !this.glowWasActive) {
       this.aimHover = false;
       return; // already at base emissive: skip uniform writes
     }
     this.glowWasActive = active;
-    const pulse = grabbed
-      ? 0.32
-      : 0.22 + 0.13 * Math.sin(timestamp / 1000 * 6);
+    const pulse = 0.22 + 0.13 * Math.sin(timestamp / 1000 * 6);
     for (const e of this.highlightMats) {
       if (!active) {
         e.mat.emissive.copy(e.base);

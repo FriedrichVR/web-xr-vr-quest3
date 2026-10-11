@@ -14,6 +14,15 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.8.0] - 2026-10-11
+#### ✨ Sin Overlay al Seleccionar + Rotación/Movimiento Directo estilo Meta
+- **Glow solo en hover:** el highlight se apaga al agarrar/seleccionar el modelo (look limpio durante la manipulación) y vuelve al apuntar en vacío. Restaura el emisivo base como siempre.
+- **Rotación y traslación incrementales (direct manipulation):**
+  - Antes: targets calculados en absoluto desde el inicio del grab (sensación de "nado"/deriva + lag acumulado).
+  - Ahora: cada frame aplica el **delta de manos** (dirección + roll de muñeca) sobre el target acumulado, y el offset del centroide viaja rotado y reescalado con ese delta — el objeto va rígidamente "en las manos", como en las apps de Meta.
+  - Tracking pos/rot `k=22 → 30` (targets ahora exactos, el lerp solo remata). Cascada de escala, EMA, clamps relativos, guards anti-NaN y hápticos sin cambios.
+  - Estado simplificado: se eliminan las referencias absolutas iniciales (midpoint/dir/up/pos/quat) a favor de `prevDir/prevMid/prevProjUp/prevTargetScale` con roll-forward y guards de degeneración.
+
 ### [v1.7.0] - 2026-10-11
 #### 🎮 Manipulación 2-Mandos sin VR + Salida de VR con B (1.2s)
 - **Rotar + escalar el modelo sin VR (Gamepad API, Quest 2D browser):**
