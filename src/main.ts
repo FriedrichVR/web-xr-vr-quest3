@@ -4,6 +4,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
+/** Sky-blue additive tint for the aim-hover glow on grabbable models. */
+const HOVER_GLOW = new THREE.Color(0x38bdf8);
+
 /**
  * World-locked 3D loading overlay: progress bar + canvas status text.
  * Shown while a GLB downloads, fades out on completion, turns red on error.
@@ -338,6 +341,20 @@ class WebXRGLBViewer {
   private readonly DESKTOP_STICK_DEADZONE = 0.18;
   private debugPads: boolean = false;
 
+  // VR UX package: aim highlight, scale haptics, bring-to-me, B/Y reset
+  private aimHover: boolean = false;
+  private highlightMats: { mat: THREE.MeshStandardMaterial; base: THREE.Color }[] = [];
+  private lastTapTime: number[] = [0, 0];
+  private readonly DOUBLE_TAP_MS = 350;
+  private recallAnim: { from: THREE.Vector3; to: THREE.Vector3; t: number } | null = null;
+  private readonly RECALL_DUR = 0.35;
+  private readonly RECALL_DIST = 0.6;
+  private lastScaleRatio: number = 1;
+  private scaleHapticCooldown: number = 0;
+  private prevButtonBState: boolean = false;
+  private recallFrom = new THREE.Vector3();
+  private recallTo = new THREE.Vector3();
+
   // Status HUD elements
   private statusDot: HTMLElement | null;
   private statusText: HTMLElement | null;
@@ -564,7 +581,12 @@ class WebXRGLBViewer {
       this.controllers.push(controller);
 
       // Event listeners for grab interactions (support both Trigger and Grip)
-      controller.addEventListener('selectstart', () => this.onGrabStart(controller));
+      // Trigger tap is evaluated first: a double-tap on empty space recalls
+      // the model; a grab on the model itself always wins (see onGrabStart).
+      controller.addEventListener('selectstart', () => {
+        this.onTriggerTap(controller);
+        this.onGrabStart(controller);
+      });
       controller.addEventListener('selectend', () => this.onGrabEnd(controller));
       controller.addEventListener('squeezestart', () => this.onGrabStart(controller));
       controller.addEventListener('squeezeend', () => this.onGrabEnd(controller));
@@ -639,6 +661,60 @@ class WebXRGLBViewer {
   }
 
   /**
+   * Trigger double-tap: recalls a lost model to 0.6m in front of the user.
+   * Runs before onGrabStart; a real grab on the model always wins because
+   * onGrabStart cancels the recall when it attaches (and bringToMe itself
+   * refuses while grabbed).
+   */
+  private onTriggerTap(controller: THREE.XRTargetRaySpace): void {
+    const idx = (controller.userData.index as number) ?? 0;
+    const now = performance.now();
+    if (now - this.lastTapTime[idx] < this.DOUBLE_TAP_MS) {
+      this.lastTapTime[idx] = 0;
+      this.bringModelToMe(controller);
+    } else {
+      this.lastTapTime[idx] = now;
+    }
+  }
+
+  private bringModelToMe(controller: THREE.XRTargetRaySpace): void {
+    if (this.activeGrabs.size > 0) return; // user holds it: nothing to recall
+    if (this.modelRoot.children.length === 0) return;
+    this.camera.getWorldPosition(this.recallTo);
+    this.camera.getWorldDirection(this.recallFrom);
+    this.recallFrom.y = 0;
+    if (this.recallFrom.lengthSq() < 1e-6) this.recallFrom.set(0, 0, -1);
+    this.recallFrom.normalize();
+    this.recallTo.addScaledVector(this.recallFrom, this.RECALL_DIST);
+    this.recallFrom.copy(this.modelRoot.position);
+    if (!Number.isFinite(this.recallTo.x + this.recallTo.y + this.recallTo.z)) return;
+    this.recallAnim = {
+      from: this.recallFrom.clone(),
+      to: this.recallTo.clone(),
+      t: 0,
+    };
+    this.triggerHaptic(controller, 0.5, 40);
+    this.updateStatus(true, 'Recalling Model • Bring To Me');
+  }
+
+  /** EaseOutCubic recall glide; cancelled by any grab or session end. */
+  private stepRecallAnim(dt: number): void {
+    if (!this.recallAnim) return;
+    if (this.activeGrabs.size > 0 || this.modelRoot.children.length === 0) {
+      this.recallAnim = null;
+      return;
+    }
+    this.recallAnim.t += dt;
+    const k = Math.min(this.recallAnim.t / this.RECALL_DUR, 1);
+    const e = 1 - Math.pow(1 - k, 3);
+    this.modelRoot.position.lerpVectors(this.recallAnim.from, this.recallAnim.to, e);
+    if (k >= 1) {
+      this.recallAnim = null;
+      this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+    }
+  }
+
+  /**
    * Grab interaction start: handles 1-hand initial grab or 2-hand transition
    */
   private onGrabStart(controller: THREE.XRTargetRaySpace): void {
@@ -649,6 +725,7 @@ class WebXRGLBViewer {
       return;
     }
 
+    this.recallAnim = null; // a real grab always wins over a recall glide
     this.triggerHaptic(controller, 0.6, 50);
 
     const ctrlPos = new THREE.Vector3().setFromMatrixPosition(controller.matrixWorld);
@@ -722,6 +799,8 @@ class WebXRGLBViewer {
         smoothedRatio: 1,
         prevRawDist: dist,
       };
+      this.lastScaleRatio = 1;
+      this.scaleHapticCooldown = 0;
 
       this.updateStatus(true, 'Two-Hand 3D Rotating & Scaling');
     }
@@ -868,6 +947,26 @@ class WebXRGLBViewer {
     if (this.targetPos.length() > 20) return;
 
     this.hasTarget = true;
+
+    // Scale haptics: buzz at the 0.05x/8.0x ends, velocity texture while moving
+    this.scaleHapticCooldown -= dt;
+    if (this.scaleHapticCooldown <= 0) {
+      const atLimit = rawRatio <= 0.05001 || rawRatio >= 7.9999;
+      if (atLimit) {
+        this.triggerHaptic(c1, 0.8, 45);
+        this.triggerHaptic(c2, 0.8, 45);
+        this.scaleHapticCooldown = 0.5;
+      } else {
+        const speed = Math.abs(st.smoothedRatio - this.lastScaleRatio) / Math.max(dt, 1e-4);
+        if (speed > 0.6) {
+          const intensity = Math.min(0.15 + speed * 0.12, 0.6);
+          this.triggerHaptic(c1, intensity, 20);
+          this.triggerHaptic(c2, intensity, 20);
+          this.scaleHapticCooldown = 0.15;
+        }
+      }
+    }
+    this.lastScaleRatio = st.smoothedRatio;
   }
 
   /**
@@ -896,7 +995,39 @@ class WebXRGLBViewer {
       if (!hit) {
         reticle.visible = false;
       }
+      if (hit) this.aimHover = true;
     }
+  }
+
+  /**
+   * Aim highlight: pulse emissive while a ray hovers the model, steady glow
+   * while grabbed, off otherwise. Restores each material's base emissive.
+   */
+  private glowWasActive: boolean = false;
+
+  private updateHoverHighlight(timestamp: number): void {
+    if (this.highlightMats.length === 0) return;
+    const grabbed = this.activeGrabs.size > 0;
+    const active = this.aimHover || grabbed;
+    if (!active && !this.glowWasActive) {
+      this.aimHover = false;
+      return; // already at base emissive: skip uniform writes
+    }
+    this.glowWasActive = active;
+    const pulse = grabbed
+      ? 0.32
+      : 0.22 + 0.13 * Math.sin(timestamp / 1000 * 6);
+    for (const e of this.highlightMats) {
+      if (!active) {
+        e.mat.emissive.copy(e.base);
+        e.mat.emissiveIntensity = 1;
+      } else {
+        // Additive sky-blue glow over the author's base emissive
+        e.mat.emissive.copy(e.base).lerp(HOVER_GLOW, 0.55);
+        e.mat.emissiveIntensity = 1 + pulse;
+      }
+    }
+    this.aimHover = false; // re-armed by updateControllerRays each frame
   }
 
   /**
@@ -908,12 +1039,23 @@ class WebXRGLBViewer {
       this.modelRoot.remove(this.modelRoot.children[0]);
     }
 
-    // Enable shadows on all child meshes
+    // Enable shadows on all child meshes + cache emissive-capable materials
+    // for the aim highlight (hover glow)
+    this.highlightMats = [];
     object.traverse((child) => {
       if ((child as THREE.Mesh).isMesh) {
         const mesh = child as THREE.Mesh;
         mesh.castShadow = true;
         mesh.receiveShadow = true;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const m of mats) {
+          const std = m as THREE.MeshStandardMaterial;
+          if (std && 'emissive' in std && std.emissive instanceof THREE.Color) {
+            if (!this.highlightMats.some((e) => e.mat === std)) {
+              this.highlightMats.push({ mat: std, base: std.emissive.clone() });
+            }
+          }
+        }
       }
     });
 
@@ -1126,16 +1268,7 @@ class WebXRGLBViewer {
     }
 
     if (btnReset) {
-      btnReset.addEventListener('click', () => {
-        this.modelRoot.position.set(0, 1.3, -1.2);
-        this.modelRoot.rotation.set(0, 0, 0);
-        this.modelRoot.scale.set(
-          this.normalizedScale,
-          this.normalizedScale,
-          this.normalizedScale
-        );
-        this.updateStatus(true, 'Position Reset • World-Locked');
-      });
+      btnReset.addEventListener('click', () => this.resetModelPose());
     }
   }
 
@@ -1198,16 +1331,19 @@ class WebXRGLBViewer {
 
   /**
    * Polls Meta Quest 3 controller buttons
-   * Detects Button A on the right controller (buttons[4] in xr-standard)
+   * - Button A (right, buttons[4]): passthrough toggle
+   * - Button B/Y (either hand, buttons[5]): reset model pose — no headset-off
    */
   private checkControllerButtons(): void {
     const session = this.renderer.xr.getSession();
     if (!session) return;
 
+    let bPressed = false;
     for (const source of session.inputSources) {
-      // Quest 3 Right Controller
-      if (source.handedness === 'right' && source.gamepad) {
-        const gamepad = source.gamepad;
+      if (!source.gamepad) continue;
+      const gamepad = source.gamepad;
+      // Quest 3 Right Controller: Button A passthrough toggle
+      if (source.handedness === 'right') {
         // In WebXR xr-standard mapping: buttons[4] is the primary face button (Button A)
         const btnA = gamepad.buttons[4];
         if (btnA) {
@@ -1222,7 +1358,32 @@ class WebXRGLBViewer {
           this.prevButtonAState = isPressed;
         }
       }
+      // Secondary face button (B on right / Y on left, buttons[5]): pose reset
+      const btnB = gamepad.buttons[5];
+      if (btnB && (btnB.pressed || btnB.value > 0.5)) {
+        bPressed = true;
+        if (!this.prevButtonBState) {
+          this.resetModelPose();
+          if (gamepad.hapticActuators && gamepad.hapticActuators[0]) {
+            gamepad.hapticActuators[0].pulse(0.6, 40);
+          }
+        }
+      }
     }
+    this.prevButtonBState = bPressed;
+  }
+
+  /** Restores position + rotation + normalized scale (HUD Reset + B/Y share it). */
+  private resetModelPose(): void {
+    this.recallAnim = null;
+    this.modelRoot.position.set(0, 1.3, -1.2);
+    this.modelRoot.rotation.set(0, 0, 0);
+    this.modelRoot.scale.set(
+      this.normalizedScale,
+      this.normalizedScale,
+      this.normalizedScale
+    );
+    this.updateStatus(true, 'Position Reset • World-Locked');
   }
 
   /**
@@ -1325,6 +1486,27 @@ class WebXRGLBViewer {
     el.addEventListener('pointercancel', endDrag);
     el.addEventListener('lostpointercapture', endDrag);
     window.addEventListener('blur', cancelDrag);
+    // Desktop parity for VR double-trigger recall: double-click empty space
+    // brings a lost model back (a real grab still wins on the model itself).
+    el.addEventListener('dblclick', (e) => {
+      if (this.renderer.xr.isPresenting) return;
+      if (this.activeGrabs.size > 0 || this.desktopDrag) return;
+      this.dragNdc.set(
+        (e.clientX / window.innerWidth) * 2 - 1,
+        -(e.clientY / window.innerHeight) * 2 + 1
+      );
+      this.raycaster.setFromCamera(this.dragNdc, this.camera);
+      const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);
+      if (hits.length > 0) return;
+      this.camera.getWorldPosition(this.recallTo);
+      this.camera.getWorldDirection(this.recallFrom);
+      this.recallFrom.y = 0;
+      if (this.recallFrom.lengthSq() < 1e-6) this.recallFrom.set(0, 0, -1);
+      this.recallFrom.normalize();
+      this.recallTo.addScaledVector(this.recallFrom, this.RECALL_DIST);
+      this.recallAnim = { from: this.modelRoot.position.clone(), to: this.recallTo.clone(), t: 0 };
+      this.updateStatus(true, 'Recalling Model • Bring To Me');
+    });
   }
 
   /**
@@ -1494,6 +1676,7 @@ class WebXRGLBViewer {
     // Process XR inputs and transformations if active
     if (this.renderer.xr.isPresenting) {
       this.checkControllerButtons();
+      this.stepRecallAnim(dt);
       this.updateTwoHandTransform(dt);
       this.updateControllerRays();
 
@@ -1510,6 +1693,7 @@ class WebXRGLBViewer {
         this.hasTarget = false;
       }
     } else {
+      this.stepRecallAnim(dt);
       this.updateDesktopScale(dt);
       if (!this.desktopDrag) this.controls.update();
     }
@@ -1518,6 +1702,9 @@ class WebXRGLBViewer {
     if (this.boundingBoxHelper && this.boundingBoxHelper.visible) {
       this.boundingBoxHelper.update();
     }
+
+    // Aim highlight runs in and out of VR (restores base emissive on exit)
+    this.updateHoverHighlight(timestamp);
 
     // In-scene loading overlay: billboard, indeterminate pulse, auto fade
     this.loadingUI.tick(timestamp, this.camera, dt);

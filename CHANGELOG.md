@@ -14,6 +14,14 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.6.0] - 2026-10-11
+#### ✨ Paquete UX en VR: Highlight + Hápticos + Bring-To-Me + Reset en Mando
+- **Highlight al apuntar:** el modelo brilla (pulso emisivo sky-blue) cuando un ray lo toca y glow fijo mientras se agarra; restaura el emisivo original al soltar. Materiales cacheados por carga (incluye multi-material, ignora básicos sin emissive).
+- **Hápticos con significado (2 manos):** buzz al tocar los topes 0.05x/8.0x (cooldown 500ms) + vibración proporcional a la velocidad de escalado (cooldown 150ms). En ambos mandos.
+- **Bring-to-me:** doble trigger al vacío trae el modelo a 0.6m frente al usuario (glide 0.35s easeOutCubic). Un grab real siempre gana (cancela el glide); no dispara si ya está agarrado. Paridad desktop: doble-click en vacío hace lo mismo.
+- **Reset en B/Y (botones[5], cualquier mano):** restaura pose sin sacarse el visor (mismo `resetModelPose()` del botón HUD, ahora compartido) + pulso háptico.
+- Núcleo VR intacto (grips, EMA, cascada, world-lock sin cambios). Guía del HUD actualizada.
+
 ### [v1.5.2] - 2026-10-11
 #### ⚡ Menor Latencia en Escalado VR a 2 Manos
 - **Causa del lag:** la cascada anti-escalones sumaba ~200ms (EMA α=0.15 + distancia k=10 + ratio k=8 + lerp final k=14 + slew 3.0/s que capaba gestos rápidos).
