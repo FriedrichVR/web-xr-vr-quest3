@@ -14,6 +14,21 @@
 
 ## 📈 Historial Incremental de Cambios
 
+### [v1.3.0] - 2026-10-11
+#### ✨ Desktop Grab/Pan + 🧈 Escalado Continuo sin Escalones
+- **Escalado a 2 manos sin "incrementos" (causa raíz del escalonado):**
+  - Se eliminó el dead-zone duro sobre la escala absoluta (congelaba el valor y al liberarlo saltaba ~0.005 = escalón visible).
+  - Nueva cascada de 3 etapas frame-rate independent (`updateTwoHandTransform(dt)`):
+    - A) Freeze sub-perceptual de 0.4mm en distancia (mata el jitter en reposo de forma invisible).
+    - B) Suavizado exponencial de la distancia (`k=10`).
+    - C) Ease exponencial del ratio (`k=8`) + **slew-rate limit** (3.0 ratio/s): el glide es continuo, los picos no pueden escalonar.
+  - El lerp final de escala baja de `k=38` a `k=14` (el target ya llega suave, solo remata).
+  - La traslación del centroide usa el ratio suavizado (también deja de saltar).
+- **Grab/Pan del modelo fuera de VR (browser del Quest / desktop):**
+  - Click **izquierdo o derecho** (o un dedo en touch) **sobre el modelo** lo agarra y lo panea en el plano paralelo a la cámara 1:1.
+  - Click fuera del modelo = OrbitControls normal (órbita/zoom). Segundo dedo = devuelve el control a OrbitControls (pinch/rotar).
+  - Click derecho no abre menú (prevenido solo en el canvas). Clamp de volumen (`y ≥ 0.05`, radio ≤ 12m). Guía agregada al HUD.
+
 ### [v1.2.3] - 2026-10-11
 #### 🐛 Fix Crítico: Modelo Desaparece al Escalar/Rotar a 2 Manos
 - **Causa:** aliasing de vectores temporales reutilizados (`tmpVec1/2/3`): `midpoint`, `dir` y `up` se sobrescribían entre sí en el mismo frame, corrompiendo `twoHandState` inicial y el target por frame (NaN / offsets gigantes).

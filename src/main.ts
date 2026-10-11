@@ -61,6 +61,10 @@ class WebXRGLBViewer {
     filteredP1: THREE.Vector3;
     filteredP2: THREE.Vector3;
     emaAlpha: number;
+    // Cascaded scale smoothing (buttery pinch-zoom without steps)
+    smoothedDistance: number;
+    smoothedRatio: number;
+    prevRawDist: number;
   } | null = null;
 
   // Smoothing state
@@ -89,9 +93,22 @@ class WebXRGLBViewer {
   private sQTmp = new THREE.Quaternion();
 
   // Smoothing constants (Meta Quest 3 best practices)
-  private readonly SMOOTH_K_SCALE = 38;    // Scale: more responsive, less smoothing
+  private readonly SMOOTH_K_SCALE = 14;    // Final scale ease (input already smoothed upstream)
   private readonly SMOOTH_K_POS_ROT = 22;  // Position/Rotation: smoother
-  private readonly SCALE_DEAD_ZONE = 0.005; // 5mm dead zone for scale stability
+  private readonly SMOOTH_K_DIST = 10;     // Stage 1: smooths raw hand distance (jitter filter)
+  private readonly SMOOTH_K_RATIO = 8;     // Stage 2: smooths scale ratio (removes steps)
+  private readonly MAX_RATIO_RATE = 3.0;   // Slew limit: ratio units per second (kills spikes, keeps fast gestures)
+  private readonly DIST_FREEZE_EPS = 0.0004; // Sub-perceptual freeze (0.4mm): kills rest jitter invisibly
+
+  // Desktop (non-VR) model grab/pan state — mouse left/right or single touch
+  private desktopDrag: {
+    pointerId: number;
+    grabOffset: THREE.Vector3;
+    plane: THREE.Plane;
+  } | null = null;
+  private dragNdc = new THREE.Vector2();
+  private dragHit = new THREE.Vector3();
+  private dragDelta = new THREE.Vector3();
 
   // Status HUD elements
   private statusDot: HTMLElement | null;
@@ -458,6 +475,10 @@ class WebXRGLBViewer {
         filteredP1: p1.clone(),
         filteredP2: p2.clone(),
         emaAlpha,
+        // Scale cascade starts settled (ratio 1:1, no jump on grab)
+        smoothedDistance: dist,
+        smoothedRatio: 1,
+        prevRawDist: dist,
       };
 
       this.updateStatus(true, 'Two-Hand 3D Rotating & Scaling');
@@ -489,10 +510,13 @@ class WebXRGLBViewer {
 
   /**
    * Per-frame manipulation logic during two-hand gestures:
-   * Uses GRIP SPACE with EMA filtering for stable tracking (Meta best practice)
+   * Uses GRIP SPACE with EMA filtering for stable tracking (Meta best practice).
+   * Scale path is a 3-stage cascade (EMA positions -> smoothed distance ->
+   * slew-limited ratio) so pinch-zoom feels continuous, never stepped.
    */
-  private updateTwoHandTransform(): void {
+  private updateTwoHandTransform(dt: number): void {
     if (!this.twoHandState || this.activeGrabs.size < 2) return;
+    const st = this.twoHandState;
 
     const [c1, c2] = Array.from(this.activeGrabs.keys());
     const idx1 = c1.userData.index as number;
@@ -516,25 +540,37 @@ class WebXRGLBViewer {
     const p2 = this.twoHandState.filteredP2;
 
     // 2. Current geometry between FILTERED controller positions
-    const currentDistance = Math.max(p1.distanceTo(p2), 0.05);
+    const rawDist = Math.max(p1.distanceTo(p2), 0.05);
     this.sMid.addVectors(p1, p2).multiplyScalar(0.5);
     this.sDir.subVectors(p2, p1);
     if (this.sDir.lengthSq() < 1e-10) return; // hands on top of each other: skip frame
     this.sDir.normalize();
 
-    // 3. Dual-hand Pinch / Stretch Scaling with DEAD ZONE (prevents micro-jitter)
-    const scaleRatio = THREE.MathUtils.clamp(
-      currentDistance / this.twoHandState.initialDistance, 0.05, 8.0
-    );
-    const baseScale = this.twoHandState.initialModelScale.x;
-    let targetScaleVal = baseScale * scaleRatio;
-
-    // Dead zone: only update scale if change exceeds threshold
-    const scaleDelta = Math.abs(targetScaleVal - this.modelRoot.scale.x);
-    if (scaleDelta < this.SCALE_DEAD_ZONE) {
-      targetScaleVal = this.modelRoot.scale.x; // Hold current scale
+    // 3. Cascaded scale smoothing (no hard dead-zone -> no steps):
+    //  Stage A: sub-perceptual freeze kills rest jitter invisibly (0.4mm in
+    //           hand distance, far below visible scale change).
+    let frozenDist = rawDist;
+    if (Math.abs(rawDist - st.prevRawDist) < this.DIST_FREEZE_EPS) {
+      frozenDist = st.prevRawDist;
     }
-    targetScaleVal = THREE.MathUtils.clamp(targetScaleVal, 0.05, 8.0);
+    st.prevRawDist = frozenDist;
+    //  Stage B: exponential smoothing of the distance itself.
+    const aD = 1 - Math.exp(-this.SMOOTH_K_DIST * dt);
+    st.smoothedDistance += (frozenDist - st.smoothedDistance) * aD;
+    //  Stage C: slew-rate limit on the ratio — continuous glide toward the
+    //           target, spikes physically cannot step the scale.
+    const rawRatio = THREE.MathUtils.clamp(
+      st.smoothedDistance / st.initialDistance, 0.05, 8.0
+    );
+    const maxStep = this.MAX_RATIO_RATE * dt;
+    const aR = 1 - Math.exp(-this.SMOOTH_K_RATIO * dt);
+    let step = (rawRatio - st.smoothedRatio) * aR; // exponential ease toward target
+    step = THREE.MathUtils.clamp(step, -maxStep, maxStep); // slew limit kills spikes
+    st.smoothedRatio = THREE.MathUtils.clamp(st.smoothedRatio + step, 0.05, 8.0);
+
+    const scaleRatio = st.smoothedRatio;
+    const baseScale = st.initialModelScale.x;
+    const targetScaleVal = THREE.MathUtils.clamp(baseScale * scaleRatio, 0.05, 8.0);
     this.targetScale.set(targetScaleVal, targetScaleVal, targetScaleVal);
 
     // 4. FULL 3D ROTATION (Pitch, Yaw, Roll) using filtered orientations
@@ -886,7 +922,78 @@ class WebXRGLBViewer {
     }
   }
 
+  /**
+   * Desktop / Quest-browser (non-VR) model grab: left-click, right-click or
+   * single-touch drag on the model pans it across the camera-facing plane.
+   * OrbitControls stay in charge when the press misses the model.
+   */
+  private setupDesktopGrab(): void {
+    const el = this.renderer.domElement;
+
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    el.addEventListener('pointerdown', (e) => {
+      if (this.renderer.xr.isPresenting) return;
+      if (e.button !== 0 && e.button !== 2) return; // left or right grab button
+      if (this.modelRoot.children.length === 0) return;
+      // Second finger/pointer: hand control back to OrbitControls (pinch/rotate)
+      if (this.desktopDrag) {
+        this.desktopDrag = null;
+        this.controls.enabled = true;
+        return;
+      }
+
+      this.dragNdc.set(
+        (e.clientX / window.innerWidth) * 2 - 1,
+        -(e.clientY / window.innerHeight) * 2 + 1
+      );
+      this.raycaster.setFromCamera(this.dragNdc, this.camera);
+      const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);
+      if (hits.length === 0) return; // missed: OrbitControls handles it
+
+      // Drag plane: faces the camera through the grab point (screen-space pan)
+      this.camera.getWorldDirection(this.dragDelta);
+      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+        this.dragDelta.clone(), hits[0].point
+      );
+      const grabOffset = this.modelRoot.position.clone().sub(hits[0].point);
+      this.desktopDrag = { pointerId: e.pointerId, grabOffset, plane };
+      this.controls.enabled = false;
+      el.setPointerCapture(e.pointerId);
+      this.updateStatus(true, 'Desktop Grab • Panning Model');
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (!this.desktopDrag || e.pointerId !== this.desktopDrag.pointerId) return;
+      if (this.renderer.xr.isPresenting) return;
+
+      this.dragNdc.set(
+        (e.clientX / window.innerWidth) * 2 - 1,
+        -(e.clientY / window.innerHeight) * 2 + 1
+      );
+      this.raycaster.setFromCamera(this.dragNdc, this.camera);
+      if (this.raycaster.ray.intersectPlane(this.desktopDrag.plane, this.dragHit)) {
+        this.modelRoot.position.copy(this.dragHit).add(this.desktopDrag.grabOffset);
+        // Keep the model in a sane inspection volume
+        this.modelRoot.position.y = Math.max(this.modelRoot.position.y, 0.05);
+        if (this.modelRoot.position.length() > 12) {
+          this.modelRoot.position.setLength(12);
+        }
+      }
+    });
+
+    const endDrag = (e: PointerEvent) => {
+      if (!this.desktopDrag || e.pointerId !== this.desktopDrag.pointerId) return;
+      this.desktopDrag = null;
+      this.controls.enabled = true;
+      this.updateStatus(true, 'World-Locked • Free 6DoF Walkaround');
+    };
+    el.addEventListener('pointerup', endDrag);
+    el.addEventListener('pointercancel', endDrag);
+  }
+
   private setupEventListeners(): void {
+    this.setupDesktopGrab();
     window.addEventListener('resize', this.onWindowResize.bind(this));
 
     // Keyboard shortcut 'A' or 'P' to toggle passthrough on desktop
@@ -907,6 +1014,7 @@ class WebXRGLBViewer {
     // Detect XR session start / end
     this.renderer.xr.addEventListener('sessionstart', () => {
       this.updateStatus(true, 'Immersive Session Active • Quest 3');
+      this.desktopDrag = null;
       this.controls.enabled = false;
     });
 
@@ -944,7 +1052,7 @@ class WebXRGLBViewer {
     // Process XR inputs and transformations if active
     if (this.renderer.xr.isPresenting) {
       this.checkControllerButtons();
-      this.updateTwoHandTransform();
+      this.updateTwoHandTransform(dt);
       this.updateControllerRays();
 
       // Apply exponential smoothing for fluid two-hand manipulation
